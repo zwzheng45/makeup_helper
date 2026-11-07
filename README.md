@@ -4,6 +4,8 @@ Mirror is a voice-first grooming assistant for blind and low-vision users. Start
 
 This prototype uses automatic conversational turns through `generateContent`. It does not use Gemini Live or continuously upload video. Responses take a round trip to the configured Gemini proxy. Spoken replies use an English voice supplied by the browser or operating system.
 
+Upload a reference makeup image to use either of two separate reference modes: guided steps toward the look, or a comparison with your current appearance. General conversation remains available without a reference.
+
 ## Requirements
 
 - Docker Engine or Docker Desktop with Docker Compose v2.24.4 or later.
@@ -100,7 +102,7 @@ docker compose -p mirror-test -f compose.test.yaml down
 
 The standalone test configuration does not load `.env.local`. It supplies a fake key and a local mock Gemini HTTP service. Tests exercise the same production application image used for deployment, and the runner performs type checking, unit tests, and Playwright tests. Reports and failure traces are written to `artifacts/`.
 
-To test the code-server deployment, use the isolated proxy override. It places a prefix-stripping HTTP proxy in front of the same Caddy configuration used for deployment, and checks page startup and a spoken turn in both browsers:
+To test the code-server deployment, use the isolated proxy override. It places a prefix-stripping HTTP proxy in front of the same Caddy configuration used for deployment, and checks page startup, a spoken turn, reference selection, and a guided reference turn in both browsers:
 
 ```sh
 docker compose -p mirror-codeserver-test -f compose.test.yaml -f compose.test.codeserver.yaml up --build --abort-on-container-exit --exit-code-from test
@@ -127,16 +129,44 @@ Keep the application stack running for this check. The helper sends only synthet
 
 When checking a code-server deployment, include `compose.codeserver.yaml` last in the helper's Compose command and set `MIRROR_BASE_URL=http://app:3000/proxy/8443` (or your configured prefix). Internal application requests must include that build-time base path.
 
+To check reference modes against the running application, the following separate live check draws two synthetic faces with different lip colors and sends an opening request in each mode. It consumes two real API requests and does not read a credential in the runner:
+
+```sh
+docker build --target test -t mirror:test-runner .
+MIRROR_APP_CONTAINER=$(docker compose --env-file .env.local -f compose.yaml -f compose.codeserver.yaml ps -q app)
+docker run --rm --network "container:$MIRROR_APP_CONTAINER" \
+  -e MIRROR_BASE_URL=http://127.0.0.1:3000/proxy/8443 \
+  mirror:test-runner npm run test:live:reference
+```
+
+For the direct local HTTPS stack, omit the code-server override and use `http://127.0.0.1:3000` as the internal application base URL. Add `-e MIRROR_REFERENCE_MODE=guided` or `compare` to check just one mode. This check validates dual-image connectivity and structured replies; it is not a measure of makeup instruction quality on real faces.
+
 ## Interaction and data flow
 
 - `Start mirror` requests permission and provides a brief framing check.
 - Speak without holding a button. New speech interrupts a current answer.
 - `Stop talking` cancels the answer while leaving the microphone active.
 - `Pause mirror` stops camera, microphone, and playback. Use `Resume mirror` to reconnect.
-- `End session` also clears the in-memory conversation. Moving the page to the background pauses capture.
+- `End session` also clears the reference image, all mode histories, and guided progress. Moving the page to the background pauses capture.
 - Preview video is mirrored; images sent to Gemini are not. Directions refer to the user's own left and right.
 
-The application keeps at most ten conversational turns in browser memory and does not save recordings or transcripts to a database. Audio and current images are sent through the configured proxy to Gemini. Provider retention is governed by the proxy and upstream service, not by this application. Only English interface copy and responses are included in this MVP.
+The application keeps at most ten conversational turns per mode in browser memory and does not save recordings or transcripts to a database. Audio and current images are sent through the configured proxy to Gemini. Reference modes also send the prepared reference image; guided mode includes the current step and a short progress summary. Provider retention is governed by the proxy and upstream service, not by this application. Only English interface copy and responses are included in this MVP.
+
+## Use a reference look
+
+Choose a JPEG, PNG, or WebP image with `Upload reference`. The original file must be no larger than 10 MiB. The browser prepares a JPEG with a longest edge of at most 1280 pixels and a size of at most 512 KiB; the original file is not uploaded. The image stays in page memory until removed, replaced, the session ends, or the page reloads. Pausing keeps it available.
+
+| Mode | Behavior |
+| --- | --- |
+| General conversation | Answers everyday grooming questions using your current camera view. An uploaded reference is not sent in this mode. |
+| Guided makeup | Introduces the reference look, clarifies your target and available products, then gives one step at a time and keeps progress across turns. |
+| Compare with reference | Describes visible differences between the reference and your current camera view without continuing the guided sequence. |
+
+The two reference modes become available after an image is ready. Choose the mode, then start the mirror. Changing mode during a session pauses camera, microphone, and playback; use `Resume mirror` to begin in the selected mode. Each mode keeps its own conversation, so returning to guided makeup retains its step and progress.
+
+In guided mode, say "done" or "next step" when the current step is finished. Asking a question does not confirm completion. The server preserves the current step until it receives an explicit confirmation, and records the completed step in the progress summary.
+
+Replacing the reference pauses capture and clears reference-related histories and progress. Removing it returns to general conversation. Neither action automatically restarts the camera or microphone. `End session` clears every mode's conversation and the reference image. The reference and current camera image are labelled separately in requests so the assistant can distinguish the desired look from what is currently visible.
 
 ## Project structure
 
