@@ -13,6 +13,8 @@ export interface TurnRequest {
   turnId: number;
   opening?: boolean;
   audio?: string;
+  /** A typed question, sent instead of audio. */
+  text?: string;
   frame?: CameraFrame;
   mode?: MirrorMode;
   reference?: ReferenceImage;

@@ -108,7 +108,7 @@ describe("turn API", () => {
   it("rejects a model's guessed end action without an explicit command", async () => {
     const { handler } = setup(() => modelResponse({ transcript: "I am done with my left cheek.", action: "end" }));
     expect(await (await handler(request())).json()).toMatchObject({
-      action: "reply", reply: "I'm still listening. Did you want me to stop speaking, pause, or end this session?",
+      action: "reply", reply: "I'm still listening. Did you want me to stop speaking, mute the microphone, or end this session?",
     });
   });
 
@@ -119,14 +119,14 @@ describe("turn API", () => {
   ])("clarifies a rejected model action without claiming it happened: %s", async (transcript, action, reply) => {
     const { handler } = setup(() => modelResponse({ transcript, action, reply }));
     expect(await (await handler(request())).json()).toMatchObject({
-      transcript, action: "reply", reply: "I'm still listening. Did you want me to stop speaking, pause, or end this session?",
+      transcript, action: "reply", reply: "I'm still listening. Did you want me to stop speaking, mute the microphone, or end this session?",
     });
   });
 
   it.each([
     ["End session, please.", "end", "Session ended."],
-    ["Stop listening.", "pause", "Paused. Use Resume when you are ready."],
-    ["Pause for a minute.", "pause", "Paused. Use Resume when you are ready."],
+    ["Stop listening.", "pause", "Microphone muted. Select Unmute microphone when you're ready."],
+    ["Pause for a minute.", "pause", "Microphone muted. Select Unmute microphone when you're ready."],
   ])("executes a common explicit command with an accurate confirmation: %s", async (transcript, action, reply) => {
     const { handler } = setup(() => modelResponse({ transcript, action: "reply", reply: "An unrelated model reply." }));
     expect(await (await handler(request())).json()).toMatchObject({ transcript, action, reply });
@@ -134,7 +134,7 @@ describe("turn API", () => {
 
   it("honors an explicit command even if the model mislabels its action", async () => {
     const { handler } = setup(() => modelResponse({ transcript: "Please pause the mirror.", action: "reply" }));
-    expect(await (await handler(request())).json()).toMatchObject({ action: "pause", reply: "Paused. Use Resume when you are ready." });
+    expect(await (await handler(request())).json()).toMatchObject({ action: "pause", reply: "Microphone muted. Select Unmute microphone when you're ready." });
   });
 
   it.each([
@@ -228,6 +228,60 @@ describe("turn API", () => {
     const response = await handler(request({}, client.signal));
     expect(response.status).toBe(499);
     expect(await response.json()).toMatchObject({ error: { code: "REQUEST_CANCELLED", retryable: false } });
+  });
+});
+
+describe("typed turns", () => {
+  const typed = (text: unknown, overrides: Record<string, unknown> = {}) => request({ audio: undefined, text, ...overrides });
+
+  it("sends the typed message instead of audio and returns it as the transcript", async () => {
+    const { handler, fetcher } = setup(() => modelResponse({ transcript: "A different invented transcript.", reply: "Your lipstick looks even." }));
+    const response = await handler(typed("  Is my lipstick even?  ", { frame: { data: JPEG, mimeType: "image/jpeg", capturedAt: NOW - 100 } }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ transcript: "Is my lipstick even?", reply: "Your lipstick looks even.", action: "reply" });
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    const parts = sent.contents.at(-1).parts as { text?: string; inlineData?: { mimeType: string } }[];
+    expect(parts[0].text).toMatch(/^User typed turn\./);
+    expect(parts.some((part) => part.text === "Typed message from the user: Is my lipstick even?")).toBe(true);
+    expect(parts.some((part) => part.inlineData?.mimeType === "audio/wav")).toBe(false);
+    expect(parts.some((part) => part.inlineData?.mimeType === "image/jpeg")).toBe(true);
+    expect(sent.systemInstruction.parts[0].text).toContain("typed turn");
+  });
+
+  it("advances a guided step when the user types done", async () => {
+    const { handler } = setup(() => modelResponse({ transcript: "", guidanceContext: NEXT_GUIDE }));
+    const result = await (await handler(typed("Done, next step", { mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.transcript).toBe("Done, next step");
+    expect(result.guidanceContext).toEqual({ ...NEXT_GUIDE, completedSummary: `${GUIDE.completedSummary}\n${GUIDE.currentStep}` });
+  });
+
+  it("does not mute anything for a typed pause request", async () => {
+    const { handler } = setup(() => modelResponse({ transcript: "Pause.", action: "pause" }));
+    expect(await (await handler(typed("Pause."))).json()).toMatchObject({
+      transcript: "Pause.", action: "reply", reply: "Typing doesn't use the microphone, so there's nothing to mute. Type your next question when you're ready.",
+    });
+  });
+
+  it("still honours an explicit typed end command", async () => {
+    const { handler } = setup(() => modelResponse({ action: "reply", reply: "Unrelated." }));
+    expect(await (await handler(typed("End session, please."))).json()).toMatchObject({ action: "end", reply: "Session ended." });
+  });
+
+  it.each([
+    ["empty text", ""],
+    ["whitespace only", "   "],
+    ["text over 1,000 characters", "a".repeat(1_001)],
+    ["a non-string", 42],
+  ] satisfies [string, unknown][])("rejects %s before contacting Gemini", async (_label, text) => {
+    const { handler, fetcher } = setup();
+    expect((await handler(typed(text))).status).toBe(400);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects a turn that has both audio and typed text", async () => {
+    const { handler, fetcher } = setup();
+    expect((await handler(request({ text: "Hello" }))).status).toBe(400);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });
 
