@@ -62,6 +62,7 @@ Playwright WebKit is not the branded Safari browser. Media behavior varies acros
 ### Local GPU voice and interaction cues
 
 - Docker production builds and TypeScript checking pass. All 202 application unit tests and 13 Python speech-service tests pass, covering PCM validation, bounded playback, cancellation, timeouts, cue cleanup, and the final-chunk queue race.
+- All 58 Chromium/WebKit browser regression checks pass, including reference modes, interruption, resource cleanup, voice failures, and processing cues. The full report is at `artifacts/playwright-report/index.html`.
 - Four Chromium/WebKit checks pass through the simulated code-server proxy with real GPU Kokoro, real browser VAD, and real AudioWorklet playback. Only Argon and the camera/microphone input fixtures are mocked in this stack. Reports are at `artifacts/tts-real/playwright-report/index.html`.
 - The V100 runs ONNX Runtime's CUDA provider with cuDNN 9.10.2. Startup profiling confirms 3,976 CUDA node executions, including 544 compute nodes; missing GPU support fails readiness instead of silently falling back to CPU.
 - With four CPU threads and a warmed V100, a 17-word sentence has 134 ms median time to first PCM versus 1,027 ms on the CPU baseline. Ten previously unseen short instructions take 97–135 ms; a fresh-container first request takes 198 ms after readiness. These measurements exclude Argon, browser buffering, and speaker output. Samples and benchmark JSON are under `artifacts/tts/gpu/`.

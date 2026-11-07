@@ -1,15 +1,27 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Page, type Request } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { installBrowserMedia, sayQuestion, trackStates, waitForReply } from "./browser-media";
 
 const mockUrl = process.env.MOCK_GEMINI_URL ?? "http://mock-gemini:8080";
 const basePath = (process.env.PLAYWRIGHT_BASE_PATH ?? "").replace(/\/$/, "");
 const appPath = (path: string) => `${basePath}${path}`;
-interface ResourceAudit { requests: string[]; failures: string[] }
+interface ResourceAudit { requests: string[]; failures: string[]; canceledVoiceResponses: Request[] }
 const resourceAudits = new WeakMap<Page, ResourceAudit>();
 
 async function expectResourcesWithinApp(page: Page, requireVad = false) {
   const audit = resourceAudits.get(page)!;
+  if (audit.canceledVoiceResponses.length) {
+    // Chromium can report ERR_ABORTED when a consumed NDJSON reader is released
+    // through the proxy. Only accept this after every turn played and completed.
+    await expect(page.getByRole("heading", { name: "I'm listening", exact: true })).toBeVisible();
+    const turns = audit.requests.filter((path) => path === appPath("/api/turn")).length;
+    await expect.poll(() => page.evaluate(() => window.__mirrorMedia.playbacks.filter((playback) => playback.events.some((event) => event.type === "drained")).length)).toBe(turns);
+    for (const request of audit.canceledVoiceResponses) {
+      const response = await request.response();
+      expect(response?.status()).toBe(200);
+      expect(response?.headers()["content-type"]).toContain("application/x-ndjson");
+    }
+  }
   expect(audit.failures, "Application resources should load successfully").toEqual([]);
   if (basePath) {
     expect(audit.requests.filter((path) => !path.startsWith(`${basePath}/`)), "Application requests must keep the proxy prefix").toEqual([]);
@@ -42,7 +54,7 @@ async function startMirror(page: Page) {
 test.beforeEach(async ({ page, request, browserName }) => {
   await request.post(`${mockUrl}/__reset`);
   await installBrowserMedia(page, browserName === "webkit");
-  const audit: ResourceAudit = { requests: [], failures: [] };
+  const audit: ResourceAudit = { requests: [], failures: [], canceledVoiceResponses: [] };
   resourceAudits.set(page, audit);
   const origin = new URL(process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000").origin;
   page.on("request", (request) => {
@@ -55,7 +67,10 @@ test.beforeEach(async ({ page, request, browserName }) => {
   });
   page.on("requestfailed", (request) => {
     const url = new URL(request.url());
-    if (url.origin === origin) audit.failures.push(`${request.failure()?.errorText} ${url.pathname}`);
+    if (url.origin !== origin) return;
+    if (url.pathname === appPath("/api/turn") && request.failure()?.errorText === "net::ERR_ABORTED") {
+      audit.canceledVoiceResponses.push(request);
+    } else audit.failures.push(`${request.failure()?.errorText} ${url.pathname}`);
   });
   await page.goto(appPath("/"));
 });
@@ -101,6 +116,7 @@ test("pause, resume and end release real media tracks", async ({ page, request }
 
 test("actual VAD sends a spoken turn with a fresh camera frame", async ({ page, request }) => {
   await startMirror(page);
+  await expect(page.getByRole("heading", { name: "I'm listening", exact: true })).toBeVisible();
   await sayQuestion(page);
   await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
   const turn = (await mockRequests(request))[1];
