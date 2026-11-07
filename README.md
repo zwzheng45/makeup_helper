@@ -1,5 +1,5 @@
 # Mirror
-
+## Live Demo at [mirror.axistence.org](mirror.axistence.org)
 Mirror is a grooming assistant built for disabled people, including blind, low-vision and nonverbal users. A short setup page comes first; then the camera fills the screen. Ask questions out loud, or type them, and Mirror answers using a current camera image. Replies are shown as text and, unless turned off, spoken.
 
 This prototype uses automatic conversational turns through `generateContent`. It does not use Gemini Live or continuously upload video. Responses take a round trip to the configured Gemini proxy and are validated in full before speech generation. A local Kokoro service then synthesizes short English phrases; the browser plays the returned PCM audio through Web Audio.
