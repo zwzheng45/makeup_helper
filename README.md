@@ -36,7 +36,7 @@ Copy `.env.example` to `.env.local`, then set `GEMINI_PROXY_KEY`. Keep the file 
 
 Always pass `--env-file .env.local` when using the main Compose stack. This configures both Compose's port/hostname interpolation and the application's runtime environment. Credentials are injected at runtime; they are not build arguments and are excluded from the image build context.
 
-Choose the entry point that matches your environment: use the default local HTTPS stack below when opening Mirror directly, or the [code-server override](#use-through-code-server) when opening it through a code-server port proxy.
+Choose the entry point that matches your environment: use the default local HTTPS stack below when opening Mirror directly, the [code-server override](#use-through-code-server) for its port proxy, or the [Cloudflare Tunnel override](#use-through-cloudflare-tunnel) for a dedicated public hostname.
 
 ## Run the production build
 
@@ -77,6 +77,19 @@ docker compose --env-file .env.local -f compose.yaml -f compose.dev.yaml -f comp
 ```
 
 Use those same three files for development `exec` or `run` commands. To return to direct local HTTPS, omit `compose.codeserver.yaml` and run the normal deployment or development command with `--build`. See [Connection modes and troubleshooting](docs/local-https.md) for details.
+
+
+## Use through Cloudflare Tunnel
+
+Use this HTTP origin when Cloudflare Tunnel supplies public HTTPS for a dedicated hostname. The application is built at `/`:
+
+```sh
+docker compose --env-file .env.local -f compose.yaml -f compose.tunnel.yaml up -d --build --wait
+```
+
+The origin defaults to `127.0.0.1:8080`. If the tunnel connector runs on a different LAN host, set `TUNNEL_BIND_ADDRESS` in `.env.local` to this application's LAN address. For an application host at `192.168.31.101` and a connector at `192.168.31.100`, set `TUNNEL_BIND_ADDRESS=192.168.31.101`, then configure the tunnel's public hostname `mirror.axistence.org` with HTTP service `http://192.168.31.101:8080`. `TUNNEL_PORT` changes the origin port.
+
+Open `https://mirror.axistence.org/` in the browser so camera and microphone APIs have a secure context. The LAN HTTP URL is the tunnel's upstream, not the browser URL. This override replaces the code-server entry point; do not combine it with `compose.codeserver.yaml`.
 
 ## Develop with hot reload
 
