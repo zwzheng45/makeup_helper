@@ -1,0 +1,15 @@
+# Cloudflare Tunnel terminates public HTTPS and forwards HTTP to this origin.
+# Use with compose.yaml, without the code-server override.
+services:
+  app:
+    build:
+      args:
+        NEXT_PUBLIC_BASE_PATH: ""
+    environment:
+      NEXT_PUBLIC_BASE_PATH: ""
+
+  caddy:
+    ports: !override
+      - "${TUNNEL_BIND_ADDRESS:-127.0.0.1}:${TUNNEL_PORT:-8080}:8080"
+    volumes:
+      - ./docker/Caddyfile.tunnel:/etc/caddy/Caddyfile:ro
