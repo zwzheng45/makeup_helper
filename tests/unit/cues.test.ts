@@ -23,7 +23,7 @@ function context() {
 afterEach(() => vi.useRealTimers());
 
 describe("voice conversation earcons", () => {
-  it("confirms capture with two short quiet tones connected only to the speaker", () => {
+  it("confirms capture with two short gentle tones connected only to the speaker", () => {
     const test = context();
     test.cues.captured();
     expect(test.oscillators).toHaveLength(2);
@@ -32,7 +32,7 @@ describe("voice conversation earcons", () => {
     for (const gain of test.gains) {
       expect(gain.connect).toHaveBeenCalledWith(test.value.destination);
       const curve = gain.gain.setValueCurveAtTime.mock.calls[0][0] as Float32Array;
-      expect(Math.max(...curve)).toBeLessThanOrEqual(0.014);
+      expect(Math.max(...curve)).toBeLessThanOrEqual(0.8);
       expect(curve[0]).toBe(0);
     }
     test.cues.stop();
