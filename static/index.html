@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="The Mirror live demo has been retired. Visit the GitHub repository for the source code and setup instructions.">
+    <meta http-equiv="refresh" content="3; url=https://github.com/zwzheng45/makeup_helper">
+    <title>Mirror — Live demo retired</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f8f7f3;
+        color: #243e35;
+        line-height: 1.6;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-height: 100vh;
+        min-height: 100svh;
+        margin: 0;
+        padding: 2rem 1.25rem;
+        display: grid;
+        place-items: center;
+      }
+
+      main { width: min(100%, 36rem); }
+
+      .brand {
+        margin: 0 0 3rem;
+        font-size: 1.5rem;
+        font-weight: 750;
+        letter-spacing: -0.06em;
+      }
+
+      h1 {
+        margin: 0 0 1.25rem;
+        font-size: clamp(2rem, 6vw, 3rem);
+        line-height: 1.15;
+        letter-spacing: -0.04em;
+        text-wrap: balance;
+      }
+
+      p { margin: 0 0 1.25rem; }
+      .notice { font-size: 1.125rem; }
+
+      a {
+        display: inline-block;
+        margin: 0.5rem 0 1rem;
+        padding: 0.875rem 1.25rem;
+        border: 1px solid transparent;
+        border-radius: 0.75rem;
+        background: #2d5846;
+        color: #fff;
+        font-weight: 650;
+        text-decoration: none;
+      }
+
+      a:hover { background: #1e4333; }
+      a:focus-visible { outline: 3px solid #1c4f9c; outline-offset: 4px; }
+      .redirect { color: #4b5946; font-size: 0.9375rem; }
+
+      @media (prefers-color-scheme: dark) {
+        :root { background: #141a17; color: #edf2ea; }
+        a { background: #a8d1a0; color: #10201a; }
+        a:hover { background: #c1e2ba; }
+        a:focus-visible { outline-color: #9cc3ff; }
+        .redirect { color: #bdc8b9; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="brand">Mirror</p>
+      <h1>The live demo is no longer available.</h1>
+      <p class="notice">Our API credit sponsorship has ended, and I can no longer cover the deployment costs.</p>
+      <p>Please visit the GitHub repository for the source code and instructions to run Mirror yourself. Thank you for your support.</p>
+      <a href="https://github.com/zwzheng45/makeup_helper">Visit the GitHub repository <span aria-hidden="true">&rarr;</span></a>
+      <p class="redirect">You will be redirected to GitHub in 3 seconds. If the redirect does not start, use the link above.</p>
+    </main>
+  </body>
+</html>
