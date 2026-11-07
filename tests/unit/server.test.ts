@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import { GET } from "../../app/api/health/route";
-import { createTurnHandler, explicitAction, MAX_REQUEST_BYTES } from "../../lib/server/gemini";
+import { confirmsGuidanceStep, createTurnHandler, explicitAction, MAX_REQUEST_BYTES } from "../../lib/server/gemini";
 
 const NOW = 1_800_000_000_000;
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9]).toString("base64");
+const REFERENCE = { data: Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0x00, 0x02, 0xff, 0xd9]).toString("base64"), mimeType: "image/jpeg" };
+const GUIDE = { goal: "A soft rose makeup look.", currentStep: "Blend the blush gently on your right cheek.", completedSummary: "Prepared the skin.", complete: false };
+const NEXT_GUIDE = { ...GUIDE, currentStep: "Blend blush on your left cheek.", completedSummary: "The model must not invent completed work." };
+
+function sizedJpeg(length: number): string {
+  const bytes = Buffer.alloc(length);
+  bytes.set([0xff, 0xd8, 0xff, 0xe0]);
+  bytes.set([0xff, 0xd9], length - 2);
+  return bytes.toString("base64");
+}
 
 function wav(seconds = 0.1, sampleRate = 16_000): string {
   const length = Math.floor(seconds * sampleRate) * 2;
@@ -231,6 +241,224 @@ describe("explicit session commands", () => {
     ["If I say stop, will you stop?", "reply"], ["Stop shaving there?", "reply"], ["End", "reply"],
     ["Don't stop listening.", "reply"], ['"Pause for a minute."', "reply"], ["Should I pause shaving for a minute?", "reply"],
   ])("interprets %s as %s", (transcript, action) => expect(explicitAction(transcript)).toBe(action));
+});
+
+describe("reference modes", () => {
+  it.each(["guided", "compare"])("requires a reference for %s", async (mode) => {
+    const { handler, fetcher } = setup();
+    const response = await handler(request({ mode }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "REFERENCE_REQUIRED" } });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["wrong MIME type", { data: REFERENCE.data, mimeType: "image/png" }],
+    ["corrupt JPEG", { data: wav(), mimeType: "image/jpeg" }],
+    ["over 512 KiB", { data: sizedJpeg(512 * 1024 + 1), mimeType: "image/jpeg" }],
+  ])("rejects a reference with %s", async (_label, reference) => {
+    const { handler, fetcher } = setup();
+    const response = await handler(request({ mode: "compare", reference }));
+    expect(response.status).toBe(400);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("labels the reference and current appearance immediately before their respective images", async () => {
+    const { handler, fetcher } = setup();
+    const response = await handler(request({ mode: "compare", reference: REFERENCE, frame: { data: JPEG, mimeType: "image/jpeg", capturedAt: NOW } }));
+    expect(response.status).toBe(200);
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    const parts = sent.contents.at(-1).parts;
+    expect(parts[0].text).toContain("Mode: compare");
+    expect(parts[2].text).toMatch(/^Reference image:/);
+    expect(parts[3].inlineData.data).toBe(REFERENCE.data);
+    expect(parts[4].text).toMatch(/^Current camera image:/);
+    expect(parts[5].inlineData.data).toBe(JPEG);
+    expect(sent.systemInstruction.parts[0].text).toContain("never evidence of the user's identity, current appearance, or completed work");
+  });
+
+  it.each([undefined, { data: JPEG, mimeType: "image/jpeg", capturedAt: NOW - 6_000 }])("keeps the reference distinct when no usable current frame exists", async (frame) => {
+    const { handler, fetcher } = setup();
+    await handler(request({ mode: "compare", reference: REFERENCE, frame }));
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    const parts = sent.contents.at(-1).parts;
+    expect(parts.filter((part: { inlineData?: { mimeType: string } }) => part.inlineData?.mimeType === "image/jpeg")).toEqual([{ inlineData: REFERENCE }]);
+    expect(parts.some((part: { text?: string }) => part.text?.startsWith("Current camera image:"))).toBe(false);
+    expect(sent.systemInstruction.parts[0].text).toContain("cannot assess the user's current result, similarity, or completion");
+  });
+
+  it("isolates general mode from supplied references and guided progress", async () => {
+    const { handler, fetcher } = setup(() => modelResponse({ guidanceContext: GUIDE }));
+    const response = await handler(request({ reference: REFERENCE, guidanceContext: GUIDE }));
+    expect(await response.json()).not.toHaveProperty("guidanceContext");
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    expect(sent.contents.at(-1).parts).toHaveLength(2);
+    expect(JSON.stringify(sent.contents)).not.toContain(REFERENCE.data);
+    expect(JSON.stringify(sent.contents)).not.toContain(GUIDE.goal);
+    expect(sent.generationConfig.responseSchema.properties).not.toHaveProperty("guidanceContext");
+  });
+
+  it("comparison neither sends nor returns a supplied guidance context", async () => {
+    const { handler, fetcher } = setup(() => modelResponse({ guidanceContext: { ...NEXT_GUIDE, complete: true } }));
+    const response = await handler(request({ mode: "compare", reference: REFERENCE, guidanceContext: GUIDE }));
+    expect(await response.json()).not.toHaveProperty("guidanceContext");
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    expect(JSON.stringify(sent.contents)).not.toContain(GUIDE.goal);
+    expect(sent.generationConfig.responseSchema.properties).not.toHaveProperty("guidanceContext");
+  });
+
+  it("fits maximum reference, camera, audio, and escaped history inside the existing request limit", async () => {
+    const { handler } = setup();
+    const response = await handler(request({
+      mode: "compare", audio: wav(30),
+      reference: { data: sizedJpeg(512 * 1024), mimeType: "image/jpeg" },
+      frame: { data: sizedJpeg(1024 * 1024), mimeType: "image/jpeg", capturedAt: NOW },
+      history: Array.from({ length: 10 }, () => ({ user: "\u0000".repeat(2_000), assistant: "\u0000".repeat(1_500) })),
+    }));
+    expect(response.status).toBe(200);
+  });
+
+  it.each([
+    { ...GUIDE, goal: "x".repeat(241) },
+    { ...GUIDE, currentStep: "x".repeat(601) },
+    { ...GUIDE, completedSummary: "x".repeat(1_201) },
+    { ...GUIDE, complete: "true" },
+  ])("rejects invalid or unbounded guidance input", async (guidanceContext) => {
+    const { handler, fetcher } = setup();
+    expect((await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext }))).status).toBe(400);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+describe("guided progress", () => {
+  it("sends bounded progress separately from a full ten-turn history", async () => {
+    const { handler, fetcher } = setup(() => modelResponse({ guidanceContext: GUIDE }));
+    await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE, history: Array.from({ length: 10 }, () => ({ user: "A question", assistant: "A reply" })) }));
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    expect(sent.contents).toHaveLength(21);
+    expect(sent.contents.at(-1).parts.at(-1).text).toBe(`Guidance context: ${JSON.stringify(GUIDE)}`);
+    expect(sent.generationConfig.responseSchema.required).toContain("guidanceContext");
+    expect(sent.generationConfig.maxOutputTokens).toBe(2_048);
+  });
+
+  it("creates only an initial goal and step even if the opening proposal invents completion", async () => {
+    const { handler } = setup(() => modelResponse({ guidanceContext: { ...GUIDE, complete: true }, reply: "You finished the entire look." }));
+    const response = await handler(request({ opening: true, audio: undefined, mode: "guided", reference: REFERENCE }));
+    const result = await response.json();
+    expect(result.guidanceContext).toEqual({ ...GUIDE, completedSummary: "", complete: false });
+    expect(result.reply).not.toContain("finished the entire look");
+  });
+
+  it("resumes an existing context without advancing on opening", async () => {
+    const { handler } = setup(() => modelResponse({ guidanceContext: NEXT_GUIDE, reply: "Move to the next step." }));
+    const result = await (await handler(request({ opening: true, audio: undefined, mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual(GUIDE);
+    expect(result.reply).toContain(GUIDE.currentStep);
+  });
+
+  it("accepts a clarification answer as the first physical step without requiring done", async () => {
+    const initial = { goal: "A soft rose reference look.", currentStep: "", completedSummary: "", complete: false };
+    let opening = true;
+    const { handler, fetcher } = setup(() => opening
+      ? modelResponse({ transcript: "", reply: "The reference has a soft rose look. Which part would you like to focus on?", guidanceContext: initial })
+      : modelResponse({ transcript: "Lips. I have lipstick.", reply: "Start by gently applying a little lipstick at the center of your lower lip.", guidanceContext: { ...initial, goal: "Soft rose lips.", currentStep: "Apply a little lipstick at the center of your lower lip." } }));
+    const first = await (await handler(request({ opening: true, audio: undefined, mode: "guided", reference: REFERENCE }))).json();
+    expect(first.guidanceContext).toEqual(initial);
+    const sent = JSON.parse((fetcher.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
+    expect(sent.systemInstruction.parts[0].text).toContain('Leave currentStep exactly ""');
+    opening = false;
+    const next = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: first.guidanceContext }))).json();
+    expect(next.guidanceContext).toEqual({ ...initial, goal: "Soft rose lips.", currentStep: "Apply a little lipstick at the center of your lower lip." });
+    expect(next.reply).not.toContain('Say "done"');
+  });
+
+  it.each(["Am I done?", "I am not done.", "How should I blend it?", "Wait, please repeat that.", 'You said "next step".']) (
+    "does not advance or claim completion for %s", async (transcript) => {
+      const { handler } = setup(() => modelResponse({ transcript, guidanceContext: { ...NEXT_GUIDE, complete: true }, reply: "The entire look is complete." }));
+      const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+      expect(result.guidanceContext).toEqual(GUIDE);
+      expect(result.reply).toContain(GUIDE.currentStep);
+      expect(result.reply).not.toContain("entire look is complete");
+    },
+  );
+
+  it("can clarify the goal while keeping the current step and completion unchanged", async () => {
+    const clarified = { ...GUIDE, goal: "A softer rose look, focusing on blush." };
+    const { handler } = setup(() => modelResponse({ transcript: "I would like a softer blush.", guidanceContext: clarified, reply: "Use a lighter touch on this same step." }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual(clarified);
+    expect(result.reply).toBe("Use a lighter touch on this same step.");
+  });
+
+  it.each([undefined, GUIDE])("does not create or change context on silence", async (guidanceContext) => {
+    const { handler } = setup(() => modelResponse({ transcript: "", guidanceContext: { ...NEXT_GUIDE, complete: true }, reply: "Made-up advice." }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext }))).json();
+    expect(result.reply).toBe("");
+    expect(result.guidanceContext).toEqual(guidanceContext);
+  });
+
+  it("preserves the step after interrupted guidance rather than treating it as performed", async () => {
+    const { handler } = setup(() => modelResponse({ transcript: "Wait.", guidanceContext: NEXT_GUIDE, reply: "Now move to the next cheek." }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE, history: [{ user: "Help", assistant: GUIDE.currentStep, interrupted: true }] }))).json();
+    expect(result.guidanceContext).toEqual(GUIDE);
+    expect(result.reply).toContain(GUIDE.currentStep);
+  });
+
+  it.each(["Done.", "I'm done.", "Next step, please."])("advances one step after an explicit confirmation: %s", async (transcript) => {
+    const { handler } = setup(() => modelResponse({ transcript, guidanceContext: NEXT_GUIDE }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual({ ...NEXT_GUIDE, completedSummary: `${GUIDE.completedSummary}\n${GUIDE.currentStep}` });
+    expect(result.guidanceContext.completedSummary).not.toContain("invent");
+  });
+
+  it("does not record a completed step when the model has not proposed the next step", async () => {
+    const { handler } = setup(() => modelResponse({ transcript: "Done.", guidanceContext: { ...GUIDE, completedSummary: "All steps finished." }, reply: "You advanced and finished all steps." }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual(GUIDE);
+    expect(result.reply).toBe("You confirmed this step, but the next step is not clear yet. Would you like to review the current step?");
+  });
+
+  it("does not lose the current step or claim advancement for an empty next-step proposal", async () => {
+    const { handler } = setup(() => modelResponse({ transcript: "Next step.", guidanceContext: { ...NEXT_GUIDE, currentStep: "" }, reply: "You have moved to the next step." }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual(GUIDE);
+    expect(result.reply).not.toContain("have moved");
+  });
+
+  it("permits final completion only after confirmation and keeps the summary bounded", async () => {
+    const prior = { ...GUIDE, completedSummary: "Earlier steps. ".repeat(85).slice(0, 1_200) };
+    const { handler } = setup(() => modelResponse({ transcript: "Done.", guidanceContext: { ...NEXT_GUIDE, complete: true } }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: prior }))).json();
+    expect(result.guidanceContext.complete).toBe(true);
+    expect(result.guidanceContext.currentStep).toBe("");
+    expect(result.guidanceContext.completedSummary).toHaveLength(1_200);
+    expect(result.guidanceContext.completedSummary.endsWith(GUIDE.currentStep)).toBe(true);
+  });
+
+  it.each(["Please pause.", "End session.", "Stop talking."])("keeps guidance unchanged for a session command: %s", async (transcript) => {
+    const { handler } = setup(() => modelResponse({ transcript, guidanceContext: NEXT_GUIDE }));
+    const result = await (await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).json();
+    expect(result.guidanceContext).toEqual(GUIDE);
+  });
+
+  it("rejects a missing guided proposal for an intelligible turn", async () => {
+    const { handler } = setup();
+    expect((await handler(request({ mode: "guided", reference: REFERENCE, guidanceContext: GUIDE }))).status).toBe(502);
+  });
+
+  it("rejects malformed context returned by the model", async () => {
+    const { handler } = setup(() => modelResponse({ guidanceContext: { ...GUIDE, goal: "x".repeat(241) } }));
+    expect((await handler(request({ mode: "guided", reference: REFERENCE }))).status).toBe(502);
+  });
+});
+
+describe("explicit step confirmations", () => {
+  it.each([
+    ["Done.", true], ["I'm done.", true], ["I’m done.", true], ["I have completed this step.", true],
+    ["Next step, please.", true], ["Please move to the next step.", true], ["Done, next step.", true],
+    ["Am I done?", false], ["Done?", false], ["I'm not done.", false], ['"Next step"', false],
+    ["Do not move to the next step.", false], ["Can you explain the next step?", false], ["Continue.", false],
+  ])("interprets %s conservatively", (transcript, expected) => expect(confirmsGuidanceStep(transcript)).toBe(expected));
 });
 
 describe("health API", () => {

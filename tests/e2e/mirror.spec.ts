@@ -195,7 +195,7 @@ test("upstream failure keeps the session available for a new question", async ({
   await configureNext(request, { status: 429 });
   await sayQuestion(page);
   await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
-  await expect(page.getByRole("status")).toContainText("The assistant is busy");
+  await expect(page.locator(".notice")).toContainText("The assistant is busy");
   await expect(page.getByRole("button", { name: "Pause mirror", exact: true })).toBeVisible();
   await sayQuestion(page);
   await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("Your hair is swept to your right"))), { timeout: 20_000 }).toBe(true);

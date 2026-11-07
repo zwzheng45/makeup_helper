@@ -18,6 +18,10 @@ The suite covers:
 - Ending while permission or VAD loading is pending, including later resource cleanup.
 - Speech playback errors and missing playback-start events, with audio reconnection.
 - Simulated backgrounding, page restoration, and explicit resume.
+- Reference upload and removal, keyboard-accessible mode selection, and automated accessibility checks with a reference selected.
+- Synthetic JPEG, PNG, and WebP inputs normalized to bounded JPEG previews; unsupported, oversized, and unreadable files rejected.
+- A real VAD turn in guided mode carrying audio, a reference image, and a separately labelled current camera image.
+- Explicit resume after mode changes, independent conversations, guided progress retention, reference replacement, obsolete-answer rejection, and end-session clearing.
 
 Type checking and unit tests run in the same test container before browser tests. The production image is built from the lockfile and run without a development server. A test run is successful only when the test service exits with code zero; HTML reports and retained traces are exported to `artifacts/`.
 
@@ -45,10 +49,23 @@ For each target:
 6. Reject permissions, interrupt the network, switch apps, and lock/unlock the phone. Confirm that capture stops when paused and only resumes explicitly.
 7. Verify camera and microphone indicators turn off after ending the session.
 8. Measure time from the end of a sentence to the first spoken response, and time from beginning an interruption to playback stopping. Report medians and observed slow cases rather than assuming a real-time guarantee.
+9. Use the screen reader to upload, replace, and remove a reference, select both reference modes, and return to general conversation. Verify upload errors, mode changes, and guided steps are understandable without inspecting the image preview.
+10. Test a reference with asymmetric makeup, a different pose, and poor lighting. Verify the assistant distinguishes the target look from the current face, reports uncertainty, and gives one usable step in guided mode. Confirm comparison mode describes differences without advancing that guided step.
 
 Playwright WebKit is not the branded Safari browser. Media behavior varies across operating systems, so automated WebKit success does not establish iPhone speech synthesis, VoiceOver, or permission compatibility. See [Playwright's browser documentation](https://playwright.dev/docs/browsers#webkit).
 
 ## Results
+
+### Reference image and separate modes follow-up
+
+- Docker production builds, TypeScript checking, and all 119 unit tests pass. The complete browser suite passes 48 checks across Chromium and WebKit, including the original session scenarios and 22 reference-related checks. The captured full report is at `artifacts/reference-full-report/index.html`.
+- The code-server prefix-stripping proxy suite passes 16 checks, including real VAD with audio plus both labelled images, selection races, cancellation, and image orientation. Its report is at `artifacts/playwright-report/index.html`.
+- Image checks cover JPEG/PNG/WebP conversion, the 1280-pixel/512-KiB output limits, EXIF orientation, removal of EXIF metadata, unsupported/corrupt/oversized inputs, and preserving the previous image after failed or canceled replacement.
+- Session checks cover independent mode histories, saved guided steps, explicit step confirmation, stale response cancellation, removal, and ending while decoding. New reference images do not reopen capture automatically. Mock transcripts make progress checks deterministic; they do not validate real speech recognition accuracy.
+- Desktop Chromium and mobile WebKit previews were inspected and have no horizontal overflow. The code-server production stack was redeployed and returns the new reference controls and a healthy API through the existing HTTP upstream.
+- The real configured `gemini-4-argon` proxy accepted two synthetic portraits through the application. Comparison correctly distinguished red lips in the reference from blue lips in the current image. Guided opening returned valid progress JSON and asked which part of the look to work on. The first guided request hit the existing 30-second timeout; one explicit retry passed in 13.817 seconds. This is a connectivity sample, not a latency guarantee or validation on real faces.
+
+Earlier results below describe the preceding version. Real-device screen readers, actual makeup guidance, and the authenticated external gateway remain pending manual validation.
 
 ### Code-server proxy follow-up
 
