@@ -3,6 +3,68 @@ import { createHash } from "node:crypto";
 
 let nextResponse = null;
 let requests = [];
+let ttsRequests = [];
+let ttsPlans = [];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function trackCancellation(response, record) {
+  response.on("close", () => {
+    if (!response.writableFinished) {
+      record.canceled = true;
+      record.canceledAt = Date.now();
+    }
+  });
+}
+
+function finish(response, record) {
+  if (response.destroyed) return;
+  record.completed = true;
+  record.completedAt = Date.now();
+  response.end();
+}
+
+function pcmChunk(durationMs, frequency) {
+  const samples = Math.round(24_000 * durationMs / 1000);
+  const pcm = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i++) pcm.writeInt16LE(Math.round(Math.sin(2 * Math.PI * frequency * i / 24_000) * 6000), i * 2);
+  return pcm;
+}
+
+async function tts(response, body) {
+  const text = body.text;
+  if (typeof text !== "string" || !text.trim()) return json(response, 400, { error: "Missing text" });
+  const plan = [...ttsPlans].reverse().find((candidate) => candidate.sentences.some((sentence) => text.includes(sentence))) ?? ttsPlans.at(-1);
+  const options = plan?.options ?? {};
+  const record = {
+    text,
+    speed: body.speed ?? null,
+    receivedAt: Date.now(), firstChunkAt: null, sentChunks: 0,
+    completed: false, canceled: false, inferenceId: plan?.inferenceId ?? null,
+  };
+  ttsRequests.push(record);
+  trackCancellation(response, record);
+  if (options.delayMs) await sleep(options.delayMs);
+  if (response.destroyed) return;
+  if (options.status && options.status !== 200) {
+    record.completed = true;
+    return json(response, options.status, { error: { message: "Simulated TTS failure" } });
+  }
+  response.writeHead(200, { "content-type": "audio/pcm; rate=24000; channels=1", "x-pcm-format": "s16le", "cache-control": "no-store" });
+  response.flushHeaders();
+  const count = options.chunkCount ?? 6;
+  const data = pcmChunk(options.chunkMs ?? 100, options.frequency ?? 440);
+  for (let index = 0; index < count; index++) {
+    if (index || options.chunkDelayMs) await sleep(options.chunkDelayMs ?? 25);
+    if (response.destroyed) return;
+    if (options.failAfterChunks === index) { response.destroy(); return; }
+    response.write(data);
+    record.firstChunkAt ??= Date.now();
+    record.sentChunks++;
+  }
+  if (options.endDelayMs) await sleep(options.endDelayMs);
+  finish(response, record);
+}
 
 function json(response, status, body) {
   response.writeHead(status, { "content-type": "application/json" });
@@ -30,10 +92,15 @@ createServer(async (request, response) => {
     if (request.url === "/__reset" && request.method === "POST") {
       nextResponse = null;
       requests = [];
+      ttsRequests = [];
+      ttsPlans = [];
       return json(response, 200, { ok: true });
     }
     if (request.url === "/__requests") return json(response, 200, { requests });
-    if (request.method !== "POST" || !request.url?.endsWith(":generateContent")) {
+    if (request.url === "/__tts") return json(response, 200, { requests: ttsRequests });
+    if (request.url === "/synthesize" && request.method === "POST") return await tts(response, await readJson(request));
+    const path = new URL(request.url ?? "/", "http://mock-gemini").pathname;
+    if (request.method !== "POST" || !/:generateContent$/.test(path)) {
       return json(response, 404, { error: "Unknown mock route" });
     }
     const body = await readJson(request);
@@ -57,6 +124,7 @@ createServer(async (request, response) => {
     const override = nextResponse;
     nextResponse = null;
     const record = {
+      id: requests.length + 1,
       opening,
       mode,
       guidanceContext,
@@ -69,11 +137,14 @@ createServer(async (request, response) => {
       hasImage: parts.some((part) => part.inlineData?.mimeType === "image/jpeg"),
       typedText,
       completed: false,
+      canceled: false,
     };
     requests.push(record);
-    if (override?.delayMs) await new Promise((resolve) => setTimeout(resolve, override.delayMs));
-    record.completed = true;
+    trackCancellation(response, record);
+    if (override?.delayMs) await sleep(override.delayMs);
+    if (response.destroyed) return;
     if (override?.status && override.status !== 200) {
+      record.completed = true;
       return json(response, override.status, { error: { message: "Simulated upstream failure" } });
     }
     const generalAnswer = {
@@ -93,10 +164,14 @@ createServer(async (request, response) => {
       ...generalAnswer,
       reply: opening ? "The reference has rose blush. Your current cheeks look lighter." : "Your left cheek looks closer to the reference; your right cheek looks lighter.",
     } : generalAnswer);
+    ttsPlans.push({ inferenceId: record.id, options: override?.tts ?? {}, sentences: answer.reply.match(/[^.!?]+[.!?]?(?:\s+|$)/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [answer.reply] });
+    record.completed = true;
+    record.completedAt = Date.now();
     return json(response, 200, {
       candidates: [{ content: { role: "model", parts: [{ text: JSON.stringify(answer) }] } }],
     });
   } catch {
-    json(response, 400, { error: { message: "Invalid mock request" } });
+    if (response.headersSent) response.destroy();
+    else if (!response.destroyed) json(response, 400, { error: { message: "Invalid mock request" } });
   }
 }).listen(8080, "0.0.0.0", () => console.log("Mock Gemini listening on port 8080."));

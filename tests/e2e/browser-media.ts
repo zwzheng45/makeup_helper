@@ -1,22 +1,33 @@
 import { readFile } from "node:fs/promises";
-import type { Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
+
+interface PlaybackAudit {
+  playbackId: number | null;
+  commands: { type: string; at: number; samples?: number; segmentId?: number }[];
+  events: Record<string, unknown>[];
+  peak: number;
+  stopRequestedAt?: number;
+}
 
 interface TestMedia {
   streams: MediaStream[];
   destinations: MediaStreamAudioDestinationNode[];
   contexts: AudioContext[];
-  speech: string[];
-  canceled: string[];
+  playbacks: PlaybackAudit[];
+  playerNodes: AudioWorkletNode[];
+  pcmSamples: { playbackId: number | null; at: number; peak: number }[];
   denyPermission: boolean;
   holdPermission: boolean;
   pendingPermission: boolean;
   releasePermission?: () => void;
-  playbackMs: number;
   speaking: boolean;
-  speechMode: "normal" | "error" | "silent";
+  cueOscillators: { startedAt: number; endsAt: number }[];
+  workletPaths: string[];
+  failPlayerLoad: boolean;
   /** What each getUserMedia call asked for, to prove typed mode never opens the microphone. */
   requests: { audio: boolean; video: boolean }[];
-  rates: number[];
+  /** Every AudioContext the page created, including playback-only ones. */
+  createdContexts: number;
 }
 
 declare global {
@@ -27,9 +38,12 @@ declare global {
 export async function installBrowserMedia(page: Page, fakeVideoPlayback = false) {
   await page.addInitScript(({ fakeVideoPlayback }) => {
     const media: TestMedia = {
-      streams: [], destinations: [], contexts: [], speech: [], canceled: [],
+      streams: [], destinations: [], contexts: [], playbacks: [], playerNodes: [], pcmSamples: [],
       denyPermission: false, holdPermission: false, pendingPermission: false,
-      playbackMs: 150, speaking: false, speechMode: "normal", requests: [], rates: [],
+      speaking: false,
+      cueOscillators: [],
+      workletPaths: [], failPlayerLoad: false,
+      requests: [], createdContexts: 0,
     };
     window.__mirrorMedia = media;
     const cameraFrames = new Map<MediaStream, HTMLCanvasElement>();
@@ -80,9 +94,74 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
       constructor(options?: AudioContextOptions) {
         super(options);
         applicationContext = this;
+        media.createdContexts++;
+        const addModule = this.audioWorklet.addModule.bind(this.audioWorklet);
+        Object.defineProperty(this.audioWorklet, "addModule", { configurable: true, value: (url: string | URL, options?: WorkletOptions) => {
+          const path = new URL(String(url), window.location.href).pathname;
+          media.workletPaths.push(path);
+          if (media.failPlayerLoad && path.endsWith("/audio/pcm-player.worklet.js")) {
+            media.failPlayerLoad = false;
+            return Promise.reject(new Error("The audio player could not be loaded."));
+          }
+          return addModule(String(url), options);
+        } });
+      }
+      createOscillator(): OscillatorNode {
+        const oscillator = super.createOscillator();
+        const audit = { startedAt: Infinity, endsAt: Infinity };
+        media.cueOscillators.push(audit);
+        const start = oscillator.start.bind(oscillator);
+        const stop = oscillator.stop.bind(oscillator);
+        oscillator.start = (when = 0) => {
+          audit.startedAt = Date.now() + Math.max(0, when - this.currentTime) * 1000;
+          start(when);
+        };
+        oscillator.stop = (when = 0) => {
+          audit.endsAt = Date.now() + Math.max(0, when - this.currentTime) * 1000;
+          stop(when);
+        };
+        return oscillator;
       }
     }
     Object.defineProperty(window, "AudioContext", { configurable: true, value: CapturedAudioContext });
+
+    // Observe the real player without replacing its queue, resampling, timing,
+    // or AudioWorklet code. A silent analyser branch measures actual samples.
+    const NativeWorkletNode = window.AudioWorkletNode;
+    class ObservedWorkletNode extends NativeWorkletNode {
+      constructor(context: BaseAudioContext, name: string, options?: AudioWorkletNodeOptions) {
+        super(context, name, options);
+        if (name !== "mirror-pcm-player") return;
+        const audit: PlaybackAudit = { playbackId: null, commands: [], events: [], peak: 0 };
+        media.playbacks.push(audit);
+        media.playerNodes.push(this);
+        const send = this.port.postMessage.bind(this.port);
+        Object.defineProperty(this.port, "postMessage", { configurable: true, value: (message: Record<string, unknown>, ...args: unknown[]) => {
+          if (typeof message.playbackId === "number") audit.playbackId = message.playbackId;
+          audit.commands.push({ type: String(message.type), at: Date.now(), ...(message.samples instanceof Float32Array ? { samples: message.samples.length } : {}), ...(typeof message.segmentId === "number" ? { segmentId: message.segmentId } : {}) });
+          if (message.type === "stop") audit.stopRequestedAt = Date.now();
+          Reflect.apply(send, this.port, [message, ...args]);
+        } });
+        this.port.addEventListener("message", (event: MessageEvent<Record<string, unknown>>) => { audit.events.push({ ...event.data, at: Date.now() }); });
+        this.port.start();
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        const mute = context.createGain();
+        mute.gain.value = 0;
+        this.connect(analyser);
+        analyser.connect(mute);
+        mute.connect(context.destination);
+        const samples = new Float32Array(analyser.fftSize);
+        const timer = window.setInterval(() => {
+          if (context.state === "closed") { audit.peak = 0; clearInterval(timer); return; }
+          analyser.getFloatTimeDomainData(samples);
+          audit.peak = context.state === "running" ? samples.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0) : 0;
+          if (audit.peak > 0.005) media.pcmSamples.push({ playbackId: audit.playbackId, at: Date.now(), peak: audit.peak });
+        }, 20);
+      }
+    }
+    Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: ObservedWorkletNode });
+    Object.defineProperty(media, "speaking", { get: () => media.playbacks.some((playback) => playback.peak > 0.005) });
 
     // Keep a strong reference to the overridden device object. WebKit can
     // recreate a native wrapper after collection, losing an expando override.
@@ -149,65 +228,12 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
       },
     });
 
-    // A native utterance only accepts native SpeechSynthesisVoice objects. Mock
-    // both boundaries together; headless systems often have no installed voice.
-    class TestUtterance extends EventTarget {
-      text: string;
-      lang = "";
-      voice: SpeechSynthesisVoice | null = null;
-      rate = 1;
-      pitch = 1;
-      volume = 1;
-      onstart: SpeechSynthesisUtterance["onstart"] = null;
-      onend: SpeechSynthesisUtterance["onend"] = null;
-      onerror: SpeechSynthesisUtterance["onerror"] = null;
-      constructor(text = "") { super(); this.text = text; }
-    }
-    Object.defineProperty(window, "SpeechSynthesisUtterance", { configurable: true, value: TestUtterance });
-    const voice = { name: "Test English voice", lang: "en-GB", localService: true, default: true, voiceURI: "test-english" };
-    let timer: number | undefined;
-    let active: SpeechSynthesisUtterance | null = null;
-    const synthesis = new EventTarget();
-    Object.assign(synthesis, {
-      getVoices: () => [voice],
-      speak: (utterance: SpeechSynthesisUtterance) => {
-        if (!utterance.text) return;
-        active = utterance;
-        media.speech.push(utterance.text);
-        media.rates.push(utterance.rate);
-        media.speaking = true;
-        if (media.speechMode === "silent") return;
-        if (media.speechMode === "error") {
-          timer = window.setTimeout(() => {
-            if (active !== utterance) return;
-            utterance.onerror?.call(utterance, Object.assign(new Event("error"), { error: "audio-busy" }) as SpeechSynthesisErrorEvent);
-          }, 0);
-          return;
-        }
-        utterance.onstart?.call(utterance, new Event("start") as SpeechSynthesisEvent);
-        timer = window.setTimeout(() => {
-          if (active !== utterance) return;
-          active = null;
-          media.speaking = false;
-          utterance.onend?.call(utterance, new Event("end") as SpeechSynthesisEvent);
-        }, media.playbackMs);
-      },
-      cancel: () => {
-        if (timer) clearTimeout(timer);
-        if (active) media.canceled.push(active.text);
-        active = null;
-        media.speaking = false;
-      },
-      pause: () => {},
-      resume: () => {},
-    });
-    Object.defineProperties(synthesis, {
-      speaking: { get: () => media.speaking },
-      pending: { get: () => false },
-      paused: { get: () => false },
-    });
-    Object.defineProperty(window, "speechSynthesis", { configurable: true, value: synthesis });
   }, { fakeVideoPlayback });
+}
+
+export async function waitForReply(page: Page, text: string) {
+  await expect(page.locator(".reply-text")).toContainText(text, { timeout: 25_000 });
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.pcmSamples.length), { timeout: 10_000 }).toBeGreaterThan(0);
 }
 
 export async function sayQuestion(page: Page) {

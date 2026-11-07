@@ -1,7 +1,7 @@
 import { chromium, expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import type { GuidanceContext, TurnRequest } from "../../lib/contracts";
-import { installBrowserMedia, sayQuestion, trackStates } from "./browser-media";
+import { installBrowserMedia, sayQuestion, trackStates, waitForReply } from "./browser-media";
 
 const mockUrl = process.env.MOCK_GEMINI_URL ?? "http://mock-gemini:8080";
 const basePath = (process.env.PLAYWRIGHT_BASE_PATH ?? "").replace(/\/$/, "");
@@ -18,6 +18,7 @@ interface MockTurn {
   guidanceContext: GuidanceContext | null;
   history: string[];
   completed: boolean;
+  canceled: boolean;
 }
 
 async function mockTurns(request: APIRequestContext): Promise<MockTurn[]> {
@@ -57,7 +58,7 @@ async function waitForTurns(request: APIRequestContext, count: number) {
 }
 
 async function waitForSpeech(page: Page, text: string) {
-  await expect.poll(() => page.evaluate((text) => window.__mirrorMedia.speech.includes(text), text), { timeout: 25_000 }).toBe(true);
+  await waitForReply(page, text);
 }
 
 async function beginMirror(page: Page) {
@@ -208,8 +209,8 @@ test("reference replacement clears progress and rejects an old in-flight answer"
   expect(replaced).toMatchObject({ mode: "guided", opening: true, guidanceContext: null, history: [] });
   expect(replaced.referenceDigest).not.toBe(original.referenceDigest);
   expect((await trackStates(page)).filter((state) => state === "live")).toHaveLength(2);
-  await expect.poll(async () => (await mockTurns(request))[1]?.completed).toBe(true);
-  expect(await page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("Obsolete reference")))).toBe(false);
+  await expect.poll(async () => (await mockTurns(request))[1]?.canceled).toBe(true);
+  await expect(page.locator(".reply-text")).not.toContainText("Obsolete reference");
   await expect(page.getByText("Prepare your skin.", { exact: true })).toBeVisible();
   await expect(page.getByText("Obsolete reference step.", { exact: true })).toHaveCount(0);
 });

@@ -1,9 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
-import type { GuidanceContext, TurnRequest } from "../../lib/contracts";
+import type { GuidanceContext } from "../../lib/contracts";
 import { installBrowserMedia, trackStates } from "./browser-media";
 
 const basePath = (process.env.PLAYWRIGHT_BASE_PATH ?? "").replace(/\/$/, "");
 const appPath = (path: string) => `${basePath}${path}`;
+const mockUrl = process.env.MOCK_GEMINI_URL ?? "http://mock-gemini:8080";
 
 interface ReferenceDecodeControl {
   holdNext: boolean;
@@ -40,7 +41,8 @@ async function releaseHeldImage(page: Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test.beforeEach(async ({ page, browserName }) => {
+test.beforeEach(async ({ page, request, browserName }) => {
+  await request.post(`${mockUrl}/__reset`);
   await installBrowserMedia(page, browserName === "webkit");
   await page.addInitScript(() => {
     const control: ReferenceDecodeControl = { holdNext: false, heldUrl: "", release: null, revoked: [] };
@@ -97,14 +99,11 @@ test("removing a photo while it is still being prepared discards it", async ({ p
   expect(await page.evaluate(() => window.__mirrorMedia.streams.length)).toBe(0);
 });
 
-test("reference selection failure and an empty file picker preserve the image and guided progress", async ({ page }) => {
+test("reference selection failure and an empty file picker preserve the image and guided progress", async ({ page, request }) => {
   const guidance: GuidanceContext = {
     goal: "A soft rose look.", currentStep: "Apply blush to your left cheek.", completedSummary: "Skin preparation complete.", complete: false,
   };
-  await page.route(`**${appPath("/api/turn")}`, async (route) => {
-    const request = route.request().postDataJSON() as TurnRequest;
-    await route.fulfill({ json: { turnId: request.turnId, transcript: "", reply: "Continue with the saved blush step.", action: "reply", guidanceContext: guidance } });
-  });
+  await request.post(`${mockUrl}/__control`, { data: { answer: { transcript: "", reply: "Continue with the saved blush step.", action: "reply", guidanceContext: guidance } } });
   const input = page.getByLabel(/^(Add|Change) photo$/);
   await input.setInputFiles(await imageFile(page, "retained-look.png", "#d184a5"));
   await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toBeVisible();
@@ -132,7 +131,7 @@ test("reference selection failure and an empty file picker preserve the image an
   await expect(page.getByText(guidance.currentStep, { exact: true })).toBeVisible();
   await expect(page.getByRole("radio", { name: "Step-by-step guide", exact: true })).toBeChecked();
   await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
-  expect(await page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
 });
 
 test("reference selection applies JPEG orientation and removes EXIF metadata", async ({ page }) => {

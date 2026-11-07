@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { ApiError, GuidanceContext, MirrorAction, MirrorMode, TurnResponse } from "../contracts";
+import { isSpeechRate, type ApiError, type GuidanceContext, type MirrorAction, type MirrorMode, type SpeechRate, type TurnResponse } from "../contracts";
+import { createSpeechResponse } from "./tts";
 
 export const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 1024 * 1024;
@@ -26,6 +27,7 @@ const requestSchema = z.object({
   guidanceContext: guidanceContextSchema.optional(),
   audio: z.string().min(1).max(1_400_000).optional(),
   text: z.string().max(1_000).transform((value) => value.trim()).pipe(z.string().min(1)).optional(),
+  speechRate: z.number().refine(isSpeechRate).optional(),
   frame: z.object({
     data: z.string().min(1).max(1_400_000),
     mimeType: z.literal("image/jpeg"),
@@ -78,7 +80,9 @@ export interface TurnHandlerDependencies {
   fetch?: typeof fetch;
   now?: () => number;
   timeoutMs?: number;
-  config?: { apiKey?: string; baseUrl?: string; model?: string };
+  ttsFirstAudioTimeoutMs?: number;
+  ttsTotalTimeoutMs?: number;
+  config?: { apiKey?: string; baseUrl?: string; model?: string; ttsBaseUrl?: string };
 }
 
 class ApiFailure extends Error {
@@ -228,10 +232,14 @@ function guardGuidance(
   };
 }
 
-export function createTurnHandler(dependencies: TurnHandlerDependencies = {}) {
+function createJsonTurnHandler(dependencies: TurnHandlerDependencies = {}) {
   const fetcher = dependencies.fetch ?? fetch;
   const now = dependencies.now ?? Date.now;
-  return async function handleTurn(request: Request): Promise<Response> {
+  return async function handleTurn(
+    request: Request,
+    observedTurnId?: (turnId: number) => void,
+    observedSpeechRate?: (speechRate: SpeechRate) => void,
+  ): Promise<Response> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const controller = new AbortController();
@@ -248,9 +256,14 @@ export function createTurnHandler(dependencies: TurnHandlerDependencies = {}) {
         if (error instanceof ApiFailure) throw error;
         throw new ApiFailure(400, "INVALID_REQUEST", "The request could not be read. Please try again.");
       }
+      // The streaming wrapper needs the caller's ID for errors before metadata,
+      // without cloning or consuming the request body a second time.
+      if (raw && typeof raw === "object" && "turnId" in raw && typeof raw.turnId === "number"
+        && Number.isSafeInteger(raw.turnId) && raw.turnId >= 0) observedTurnId?.(raw.turnId);
       const parsed = requestSchema.safeParse(raw);
       if (!parsed.success) throw new ApiFailure(400, "INVALID_REQUEST", "The request contains invalid or missing information.");
       const input = parsed.data;
+      if (input.speechRate !== undefined) observedSpeechRate?.(input.speechRate);
       const mode = input.mode ?? "general";
       if (mode !== "general" && !input.reference) throw new ApiFailure(400, "REFERENCE_REQUIRED", "Choose a reference image before starting this mode.");
       if (input.audio) validateWav(input.audio);
@@ -378,5 +391,107 @@ export function createTurnHandler(dependencies: TurnHandlerDependencies = {}) {
       if (timeout) clearTimeout(timeout);
       request.signal.removeEventListener("abort", abort);
     }
+  };
+}
+
+/** Speech is added only after the existing full model validation and all guards. */
+export function createTurnHandler(dependencies: TurnHandlerDependencies = {}) {
+  const handleJson = createJsonTurnHandler(dependencies);
+  return async function handleTurn(request: Request): Promise<Response> {
+    const wantsAudio = request.headers.get("accept")?.split(",").some((value) => {
+      const [type, ...parameters] = value.trim().toLowerCase().split(";");
+      return type === "application/x-ndjson" && !parameters.some((parameter) => /^\s*q\s*=\s*0(?:\.0*)?\s*$/.test(parameter));
+    });
+    if (!wantsAudio) return handleJson(request);
+
+    // Return the body before starting Argon. The HTTP adapter can then bind a
+    // disconnected client to cancel(), even when its Request has no live signal.
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    request.signal.addEventListener("abort", abort, { once: true });
+    if (request.signal.aborted) abort();
+    // Framework Request proxies can fail Undici's private-field brand check
+    // when passed as the constructor input. Copy public properties instead;
+    // the original body stream is still consumed exactly once.
+    const upstreamRequest = new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      ...(request.method !== "GET" && request.method !== "HEAD" && request.body ? { body: request.body, duplex: "half" } : {}),
+      signal: controller.signal,
+    } as RequestInit & { duplex?: "half" });
+    const encoder = new TextEncoder();
+    let turnId = 0;
+    let speechRate: SpeechRate = 1;
+    let closed = false;
+    let speechStarted = false;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const cleanup = () => request.signal.removeEventListener("abort", abort);
+    const closeReader = async () => {
+      const currentReader = reader;
+      reader = undefined;
+      if (!currentReader) return;
+      await currentReader.cancel().catch(() => {});
+      currentReader.releaseLock();
+    };
+    const body = new ReadableStream<Uint8Array>({
+      async pull(stream) {
+        try {
+          if (!reader) {
+            const response = await handleJson(upstreamRequest, (id) => { turnId = id; }, (rate) => { speechRate = rate; });
+            if (closed) { await response.body?.cancel().catch(() => {}); return; }
+            const result = await response.json() as TurnResponse | ApiError;
+            if (closed) return;
+            if (!response.ok) {
+              stream.enqueue(encoder.encode(`${JSON.stringify({ type: "error", turnId, seq: 0, error: (result as ApiError).error })}\n`));
+              closed = true;
+              cleanup();
+              stream.close();
+              return;
+            }
+            reader = createSpeechResponse(result as TurnResponse, controller.signal, {
+              fetch: dependencies.fetch,
+              baseUrl: dependencies.config?.ttsBaseUrl ?? process.env.TTS_BASE_URL,
+              firstAudioTimeoutMs: dependencies.ttsFirstAudioTimeoutMs,
+              totalTimeoutMs: dependencies.ttsTotalTimeoutMs,
+            }, speechRate).body!.getReader();
+            speechStarted = true;
+          }
+          const currentReader = reader;
+          const next = await currentReader.read();
+          if (closed) return;
+          if (next.done) {
+            currentReader.releaseLock();
+            reader = undefined;
+            closed = true;
+            cleanup();
+            stream.close();
+          } else stream.enqueue(next.value);
+        } catch {
+          if (closed) return;
+          controller.abort();
+          await closeReader();
+          closed = true;
+          cleanup();
+          const error = { code: "CONNECTION_FAILED", message: "The assistant could not connect. Please try again.", retryable: true };
+          if (speechStarted) stream.error(new Error(error.message));
+          else {
+            stream.enqueue(encoder.encode(`${JSON.stringify({ type: "error", turnId, seq: 0, error })}\n`));
+            stream.close();
+          }
+        }
+      },
+      cancel() {
+        closed = true;
+        controller.abort();
+        cleanup();
+        return closeReader();
+      },
+    }, { highWaterMark: 0 });
+    return new Response(body, { headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      "X-Content-Type-Options": "nosniff",
+      "X-Accel-Buffering": "no",
+    } });
   };
 }

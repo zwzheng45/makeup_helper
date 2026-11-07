@@ -1,15 +1,27 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Page, type Request } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { installBrowserMedia, sayQuestion, trackStates } from "./browser-media";
+import { installBrowserMedia, sayQuestion, trackStates, waitForReply } from "./browser-media";
 
 const mockUrl = process.env.MOCK_GEMINI_URL ?? "http://mock-gemini:8080";
 const basePath = (process.env.PLAYWRIGHT_BASE_PATH ?? "").replace(/\/$/, "");
 const appPath = (path: string) => `${basePath}${path}`;
-interface ResourceAudit { requests: string[]; failures: string[] }
+interface ResourceAudit { requests: string[]; failures: string[]; canceledVoiceResponses: Request[] }
 const resourceAudits = new WeakMap<Page, ResourceAudit>();
 
 async function expectResourcesWithinApp(page: Page, requireVad = false) {
   const audit = resourceAudits.get(page)!;
+  if (audit.canceledVoiceResponses.length) {
+    // Chromium can report ERR_ABORTED when a consumed NDJSON reader is released
+    // through the proxy. Only accept this after every turn played and completed.
+    await expect(page.locator(".status")).toHaveText("Listening");
+    const turns = audit.requests.filter((path) => path === appPath("/api/turn")).length;
+    await expect.poll(() => page.evaluate(() => window.__mirrorMedia.playbacks.filter((playback) => playback.events.some((event) => event.type === "drained")).length)).toBe(turns);
+    for (const request of audit.canceledVoiceResponses) {
+      const response = await request.response();
+      expect(response?.status()).toBe(200);
+      expect(response?.headers()["content-type"]).toContain("application/x-ndjson");
+    }
+  }
   expect(audit.failures, "Application resources should load successfully").toEqual([]);
   if (basePath) {
     expect(audit.requests.filter((path) => !path.startsWith(`${basePath}/`)), "Application requests must keep the proxy prefix").toEqual([]);
@@ -18,6 +30,10 @@ async function expectResourcesWithinApp(page: Page, requireVad = false) {
     expect(audit.requests.some((path) => path === appPath("/vad/silero_vad_v5.onnx"))).toBe(true);
     expect(audit.requests.some((path) => path.startsWith(appPath("/vad/")) && path.endsWith(".wasm"))).toBe(true);
     expect(audit.requests).toContain(appPath("/api/turn"));
+    // Worklet module requests do not surface in page.on('request') in Chromium.
+    const workletPaths = await page.evaluate(() => window.__mirrorMedia.workletPaths);
+    expect(workletPaths).toContain(appPath("/audio/pcm-player.worklet.js"));
+    if (basePath) expect(workletPaths.every((path) => path.startsWith(`${basePath}/`))).toBe(true);
   }
 }
 async function configureNext(request: APIRequestContext, value: Record<string, unknown>) {
@@ -27,14 +43,19 @@ async function configureNext(request: APIRequestContext, value: Record<string, u
 
 async function mockRequests(request: APIRequestContext) {
   const response = await request.get(`${mockUrl}/__requests`);
-  return (await response.json()).requests as { opening: boolean; hasAudio: boolean; hasImage: boolean; completed: boolean; typedText: string | null }[];
+  return (await response.json()).requests as { opening: boolean; hasAudio: boolean; hasImage: boolean; completed: boolean; canceled: boolean; typedText: string | null }[];
+}
+
+async function ttsRequests(request: APIRequestContext) {
+  const response = await request.get(`${mockUrl}/__tts`);
+  return (await response.json()).requests as { text: string; speed: number | null; canceled: boolean }[];
 }
 
 const OPENING = "Your camera is ready. What would you like help with?";
 
 async function startMirror(page: Page) {
   await page.getByRole("button", { name: "Start mirror", exact: true }).click();
-  await expect.poll(() => page.evaluate((text) => window.__mirrorMedia.speech.includes(text), OPENING), { timeout: 25_000 }).toBe(true);
+  await waitForReply(page, OPENING);
 }
 
 /** Saved settings are read when the mirror page loads. */
@@ -53,7 +74,7 @@ async function setHidden(page: Page, hidden: boolean) {
 test.beforeEach(async ({ page, request, browserName }) => {
   await request.post(`${mockUrl}/__reset`);
   await installBrowserMedia(page, browserName === "webkit");
-  const audit: ResourceAudit = { requests: [], failures: [] };
+  const audit: ResourceAudit = { requests: [], failures: [], canceledVoiceResponses: [] };
   resourceAudits.set(page, audit);
   const origin = new URL(process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000").origin;
   page.on("request", (request) => {
@@ -66,7 +87,10 @@ test.beforeEach(async ({ page, request, browserName }) => {
   });
   page.on("requestfailed", (request) => {
     const url = new URL(request.url());
-    if (url.origin === origin) audit.failures.push(`${request.failure()?.errorText} ${url.pathname}`);
+    if (url.origin !== origin) return;
+    if (url.pathname === appPath("/api/turn") && request.failure()?.errorText === "net::ERR_ABORTED") {
+      audit.canceledVoiceResponses.push(request);
+    } else audit.failures.push(`${request.failure()?.errorText} ${url.pathname}`);
   });
   await page.goto(appPath("/mirror"));
 });
@@ -93,7 +117,7 @@ test("production health, keyboard entry and accessible page structure", async ({
   await expect(start).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
   await page.keyboard.press("Enter");
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.length), { timeout: 25_000 }).toBeGreaterThan(0);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.pcmSamples.length), { timeout: 25_000 }).toBeGreaterThan(0);
   // The Start button disappears; keyboard focus moves to the first new control instead of being lost.
   await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeFocused();
   await expect(page.getByText(OPENING, { exact: true })).toBeVisible();
@@ -133,20 +157,24 @@ test("Finish ends the session and returns to the setup page", async ({ page }) =
 
 test("a spoken pause request mutes the microphone instead of stopping the mirror", async ({ page, request }) => {
   await startMirror(page);
+  await expect(page.locator(".status")).toHaveText("Listening");
   await configureNext(request, { answer: { transcript: "Pause.", reply: "Pausing.", action: "pause" } });
   await sayQuestion(page);
   await expect(page.getByRole("button", { name: "Unmute microphone", exact: true })).toBeVisible({ timeout: 20_000 });
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.startsWith("Microphone muted.")))).toBe(true);
+  // No speech is synthesized for a pause, so the status region says what happened.
+  await expect(page.getByRole("status")).toContainText("Microphone muted.");
+  await expect(page.locator(".status")).toHaveText("Microphone muted");
   expect((await trackStates(page)).filter((state) => state === "live")).toHaveLength(2);
 });
 
 test("actual VAD sends a spoken turn with a fresh camera frame", async ({ page, request }) => {
   await startMirror(page);
+  await expect(page.locator(".status")).toHaveText("Listening");
   await sayQuestion(page);
   await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
   const turn = (await mockRequests(request))[1];
   expect(turn).toMatchObject({ opening: false, hasAudio: true, hasImage: true, typedText: null });
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("Your hair is swept to your right")))).toBe(true);
+  await waitForReply(page, "Your hair is swept to your right");
   await expect(page.getByText("Please look at my hair and tell me what you can see.")).toBeVisible();
   await expectResourcesWithinApp(page, true);
 });
@@ -157,19 +185,23 @@ test("a conversation starter is sent as a typed question", async ({ page, reques
   await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
   expect((await mockRequests(request))[1]).toMatchObject({ opening: false, hasAudio: false, hasImage: true, typedText: "Have I missed a spot?" });
   await expect(page.locator(".you-said")).toHaveText("You: Have I missed a spot?");
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("Your hair is swept to your right")))).toBe(true);
+  await waitForReply(page, "Your hair is swept to your right");
 });
 
 test("speaking again interrupts playback and replaces the earlier answer", async ({ page, request }) => {
   await startMirror(page);
-  await page.evaluate(() => { window.__mirrorMedia.playbackMs = 20_000; });
-  await configureNext(request, { answer: { transcript: "Please check my hair.", reply: "This is the earlier answer, which should be interrupted.", action: "reply" } });
+  const samplesBefore = await page.evaluate(() => window.__mirrorMedia.pcmSamples.length);
+  await configureNext(request, { answer: { transcript: "Please check my hair.", reply: "This is the earlier answer, which should be interrupted.", action: "reply" }, tts: { chunkCount: 100, chunkDelayMs: 100 } });
   await sayQuestion(page);
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.startsWith("This is the earlier answer"))), { timeout: 20_000 }).toBe(true);
+  await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.pcmSamples.length), { timeout: 20_000 }).toBeGreaterThan(samplesBefore);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.playbacks.at(-1)?.events.some((event) => event.type === "started"))).toBe(true);
+  const interruptedPlayback = await page.evaluate(() => window.__mirrorMedia.playbacks.at(-1)?.playbackId);
   await configureNext(request, { answer: { transcript: "Please check again.", reply: "This is the newest answer.", action: "reply" } });
   await sayQuestion(page);
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.canceled.some((text) => text.startsWith("This is the earlier answer"))), { timeout: 5000 }).toBe(true);
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.includes("This is the newest answer.")), { timeout: 20_000 }).toBe(true);
+  await expect.poll(() => page.evaluate((id) => window.__mirrorMedia.playbacks.some((playback) => playback.playbackId === id && playback.stopRequestedAt !== undefined), interruptedPlayback), { timeout: 5000 }).toBe(true);
+  await expect.poll(async () => (await ttsRequests(request)).some((turn) => turn.text.includes("earlier answer") && turn.canceled)).toBe(true);
+  await waitForReply(page, "This is the newest answer.");
 });
 
 test("a delayed answer cannot speak after the mirror stops and starts again", async ({ page, request }) => {
@@ -180,9 +212,10 @@ test("a delayed answer cannot speak after the mirror stops and starts again", as
   await setHidden(page, true);
   await setHidden(page, false);
   await page.getByRole("button", { name: "Start mirror", exact: true }).click();
-  await expect.poll(async () => (await mockRequests(request))[1]?.completed).toBe(true);
+  await expect.poll(async () => (await mockRequests(request))[1]?.canceled).toBe(true);
   await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
-  expect(await page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("obsolete answer")))).toBe(false);
+  await expect(page.locator(".reply-text")).not.toContainText("obsolete answer");
+  expect((await ttsRequests(request)).some((turn) => turn.text.includes("obsolete answer"))).toBe(false);
 });
 
 test("permission denial is recoverable without a reload", async ({ page }) => {
@@ -201,7 +234,7 @@ test("leaving the page while permission is pending stops tracks returned later",
   await page.evaluate(() => window.__mirrorMedia.releasePermission?.());
   await expect.poll(() => trackStates(page)).toEqual(["ended", "ended"]);
   await expect(page.getByRole("button", { name: "Start mirror", exact: true })).toBeVisible();
-  expect(await page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
 });
 
 test("a canceled model load cannot take over a restarted session", async ({ page, request }) => {
@@ -230,22 +263,34 @@ test("a canceled model load cannot take over a restarted session", async ({ page
   }
 });
 
-for (const mode of ["error", "silent"] as const) {
-  test(`speech ${mode} releases capture and can reconnect audio`, async ({ page }) => {
-    await page.evaluate((value) => { window.__mirrorMedia.speechMode = value; }, mode);
-    await page.getByRole("button", { name: "Start mirror", exact: true }).click();
-    const reconnect = page.getByRole("button", { name: "Reconnect audio", exact: true });
-    await expect(reconnect).toBeVisible({ timeout: 25_000 });
-    await expect.poll(async () => {
-      const states = await trackStates(page);
-      return states.length > 0 && states.every((state) => state === "ended");
-    }).toBe(true);
-    await page.evaluate(() => { window.__mirrorMedia.speechMode = "normal"; });
-    await reconnect.click();
-    await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
-    await expect.poll(async () => (await trackStates(page)).filter((state) => state === "live").length).toBe(2);
-  });
-}
+test("audio worklet loading failure releases capture and can reconnect", async ({ page }) => {
+  await page.evaluate(() => { window.__mirrorMedia.failPlayerLoad = true; });
+  await page.getByRole("button", { name: "Start mirror", exact: true }).click();
+  const reconnect = page.getByRole("button", { name: "Reconnect audio", exact: true });
+  await expect(reconnect).toBeVisible({ timeout: 25_000 });
+  await expect.poll(async () => (await trackStates(page)).every((state) => state === "ended")).toBe(true);
+  await reconnect.click();
+  await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
+  await expect.poll(async () => (await trackStates(page)).filter((state) => state === "live").length).toBe(2);
+  await sayQuestion(page);
+  await waitForReply(page, "Your hair is swept to your right");
+});
+
+test("audio processor failure stops playback and permits explicit recovery", async ({ page, request }) => {
+  await configureNext(request, { tts: { chunkCount: 100, chunkDelayMs: 100 } });
+  await page.getByRole("button", { name: "Start mirror", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.pcmSamples.length), { timeout: 25_000 }).toBeGreaterThan(0);
+  await page.evaluate(() => window.__mirrorMedia.playerNodes.at(-1)!.dispatchEvent(new Event("processorerror")));
+  const reconnect = page.getByRole("button", { name: "Reconnect audio", exact: true });
+  await expect(reconnect).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("Select Reconnect audio");
+  await expect.poll(async () => (await trackStates(page)).every((state) => state === "ended")).toBe(true);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
+  await reconnect.click();
+  await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
+  await sayQuestion(page);
+  await waitForReply(page, "Your hair is swept to your right");
+});
 
 test("upstream failure keeps the session available for a new question", async ({ page, request }) => {
   await startMirror(page);
@@ -255,7 +300,7 @@ test("upstream failure keeps the session available for a new question", async ({
   await expect(page.getByRole("status")).toContainText("The assistant is busy");
   await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
   await sayQuestion(page);
-  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speech.some((text) => text.includes("Your hair is swept to your right"))), { timeout: 20_000 }).toBe(true);
+  await waitForReply(page, "Your hair is swept to your right");
 });
 
 test("backgrounding stops capture and Start mirror reconnects", async ({ page }) => {
@@ -264,7 +309,7 @@ test("backgrounding stops capture and Start mirror reconnects", async ({ page })
   await expect(page.getByRole("button", { name: "Start mirror", exact: true })).toBeVisible();
   await expect(page.getByRole("status")).toContainText("Select Start mirror to continue");
   await expect.poll(async () => (await trackStates(page)).every((state) => state === "ended")).toBe(true);
-  expect(await page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
+  await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
 });
 
 test("pagehide and restored pageshow require Start mirror", async ({ page }) => {
@@ -284,12 +329,14 @@ test.describe("personal settings", () => {
   test("typed mode never opens the microphone and sends typed questions", async ({ page, request }) => {
     await useSettings(page, { nonverbal: true });
     await expect(page.getByText("Mirror uses your camera. You type your questions.")).toBeVisible();
+    // Replies are still read aloud by default, through the same voice stream.
     await startMirror(page);
     const question = page.getByRole("textbox", { name: "Your question" });
     await expect(question).toBeFocused();
     await expect(page.getByRole("button", { name: /microphone/i })).toHaveCount(0);
     expect(await page.evaluate(() => window.__mirrorMedia.requests)).toEqual([{ audio: false, video: true }]);
     expect(await page.evaluate(() => window.__mirrorMedia.contexts.length)).toBe(0);
+    expect(resourceAudits.get(page)!.requests.some((path) => path.startsWith(appPath("/vad/")))).toBe(false);
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await expect(page.getByRole("status")).toHaveText("Type a question first, then select Send.");
     expect(await mockRequests(request)).toHaveLength(1);
@@ -297,10 +344,19 @@ test.describe("personal settings", () => {
     await page.keyboard.press("Enter");
     await expect.poll(async () => (await mockRequests(request)).length, { timeout: 20_000 }).toBe(2);
     expect((await mockRequests(request))[1]).toMatchObject({ hasAudio: false, hasImage: true, typedText: "Is my lipstick even?" });
-    await expect(page.getByText("Your hair is swept to your right. I can help you check it again.")).toBeVisible();
+    await waitForReply(page, "Your hair is swept to your right. I can help you check it again.");
     await expect(question).toHaveValue("");
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
     expect((await trackStates(page))).toEqual(["live"]);
+  });
+
+  test("typed mode with read aloud off uses no audio at all", async ({ page, request }) => {
+    await useSettings(page, { nonverbal: true, readAloud: false });
+    await page.getByRole("button", { name: "Start mirror", exact: true }).click();
+    await expect(page.getByText(OPENING, { exact: true })).toBeVisible({ timeout: 25_000 });
+    expect(await page.evaluate(() => window.__mirrorMedia.createdContexts)).toBe(0);
+    expect(await page.evaluate(() => window.__mirrorMedia.requests)).toEqual([{ audio: false, video: true }]);
+    expect(await ttsRequests(request)).toEqual([]);
   });
 
   test("with read aloud off, replies are shown and announced but not spoken", async ({ page, request }) => {
@@ -309,14 +365,30 @@ test.describe("personal settings", () => {
     await expect(page.getByText(OPENING, { exact: true })).toBeVisible({ timeout: 25_000 });
     await expect(page.locator(".reply-text")).toHaveAttribute("aria-live", "polite");
     await expect.poll(async () => (await mockRequests(request)).length).toBe(1);
-    expect(await page.evaluate(() => window.__mirrorMedia.speech)).toEqual([]);
+    await expect(page.locator(".status")).toHaveText("Listening");
+    // The server answers in JSON, so the voice service is never asked to speak.
+    expect(await ttsRequests(request)).toEqual([]);
+    expect(await page.evaluate(() => window.__mirrorMedia.pcmSamples.length)).toBe(0);
+    expect(await page.evaluate(() => window.__mirrorMedia.workletPaths)).not.toContain(appPath("/audio/pcm-player.worklet.js"));
+    await sayQuestion(page);
+    await expect(page.getByText("Your hair is swept to your right. I can help you check it again.")).toBeVisible({ timeout: 20_000 });
+    expect(await ttsRequests(request)).toEqual([]);
   });
 
-  test("talking speed sets the speech rate and text size scales the page", async ({ page }) => {
+  test("talking speed reaches the voice service and text size scales the page", async ({ page, request }) => {
     await useSettings(page, { speed: "slow", textSize: "larger" });
     await expect(page.locator("html")).toHaveAttribute("data-text-size", "larger");
     expect(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)).toBe("24px");
     await startMirror(page);
-    expect(await page.evaluate(() => window.__mirrorMedia.rates.every((rate) => rate === 0.8))).toBe(true);
+    const spoken = await ttsRequests(request);
+    expect(spoken.length).toBeGreaterThan(0);
+    expect(spoken.every((turn) => turn.speed === 0.8)).toBe(true);
+  });
+
+  test("normal talking speed sends text alone to the voice service", async ({ page, request }) => {
+    await startMirror(page);
+    const spoken = await ttsRequests(request);
+    expect(spoken.length).toBeGreaterThan(0);
+    expect(spoken.every((turn) => turn.speed === null)).toBe(true);
   });
 });

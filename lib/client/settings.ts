@@ -1,4 +1,5 @@
 /** Personal settings chosen on the setup page and kept in this browser only. */
+import type { SpeechRate } from "../contracts";
 export type TextSize = "default" | "large" | "larger";
 export type Contrast = "auto" | "standard" | "high";
 export type Theme = "auto" | "light" | "dark";
@@ -83,7 +84,7 @@ export function applySettings(settings: MirrorSettings): void {
   }
 }
 
-export function speechRate(speed: Speed): number {
+export function speechRate(speed: Speed): SpeechRate {
   return speed === "slow" ? 0.8 : speed === "fast" ? 1.25 : 1;
 }
 
