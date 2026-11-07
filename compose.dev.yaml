@@ -11,5 +11,9 @@ services:
     tmpfs:
       - /app/.vinext:uid=1000,gid=1000,mode=0755
 
+  tts:
+    volumes:
+      - ./services/tts:/app:ro
+
 volumes:
   development_dependencies:

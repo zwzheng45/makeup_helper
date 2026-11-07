@@ -26,6 +26,7 @@ services:
       GEMINI_PROXY_KEY: test-key-never-a-real-credential
       GEMINI_PROXY_BASE_URL: http://mock-gemini:8080/v1beta
       GEMINI_MODEL: gemini-4-argon
+      TTS_BASE_URL: http://mock-gemini:8080
     depends_on:
       mock-gemini:
         condition: service_healthy
@@ -52,4 +53,4 @@ services:
       PLAYWRIGHT_BASE_URL: http://localhost:3000
       MOCK_GEMINI_URL: http://mock-gemini:8080
     volumes:
-      - ./artifacts:/app/artifacts
+      - ${MIRROR_TEST_ARTIFACTS:-./artifacts}:/app/artifacts

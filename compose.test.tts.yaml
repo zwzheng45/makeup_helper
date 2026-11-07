@@ -1,0 +1,25 @@
+# Real GPU speech synthesis with synthetic camera/microphone inputs and mock Argon.
+# This isolated stack never reads .env.local or calls a cloud speech service.
+services:
+  tts:
+    extends:
+      file: compose.yaml
+      service: tts
+    restart: "no"
+
+  app:
+    environment:
+      TTS_BASE_URL: http://tts:8000
+    depends_on:
+      tts:
+        condition: service_healthy
+    networks:
+      - default
+      - speech
+
+  test:
+    command: ["sh", "-c", "npx playwright test --grep 'production health|actual VAD'"]
+
+networks:
+  speech:
+    internal: true

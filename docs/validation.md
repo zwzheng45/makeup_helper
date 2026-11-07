@@ -4,7 +4,7 @@
 
 Run the isolated stack from the README. Tests never load the real proxy key. The Gemini mock validates the application's HTTP integration without spending provider quota; the browser tests use generated audio and camera frames.
 
-For Linux WebKit, the synthetic camera playback and frame metadata are shimmed at the test-device boundary because its canvas capture stream does not produce usable decoded video. Audio streams, ONNX inference, VAD, WAV encoding, API calls, and resource lifecycle behavior still run normally. Speech synthesis is mocked in both browser engines.
+For Linux WebKit, the synthetic camera playback and frame metadata are shimmed at the test-device boundary because its canvas capture stream does not produce usable decoded video. Audio streams, ONNX inference, VAD, WAV encoding, API calls, and resource lifecycle behavior still run normally. The standard speech-service mock produces deterministic PCM; both browsers use the real AudioWorklet and an analyser observes nonzero output. The separate real-TTS integration stack replaces those PCM fixtures with the GPU Kokoro service.
 
 The suite covers:
 
@@ -16,7 +16,9 @@ The suite covers:
 - Pause, resume, end, and stopped media tracks.
 - Permission denial, provider failure, and recovery.
 - Ending while permission or VAD loading is pending, including later resource cleanup.
-- Speech playback errors and missing playback-start events, with audio reconnection.
+- Speech playback errors, stalled playback, truncated PCM, and audio reconnection.
+- Ordered PCM playback before synthesis completes, bounded buffering, and cancellation of upstream requests.
+- Quiet processing cues and their cleanup on pause, without synthetic microphone turns.
 - Simulated backgrounding, page restoration, and explicit resume.
 - Reference upload and removal, keyboard-accessible mode selection, and automated accessibility checks with a reference selected.
 - Synthetic JPEG, PNG, and WebP inputs normalized to bounded JPEG previews; unsupported, oversized, and unreadable files rejected.
@@ -51,10 +53,20 @@ For each target:
 8. Measure time from the end of a sentence to the first spoken response, and time from beginning an interruption to playback stopping. Report medians and observed slow cases rather than assuming a real-time guarantee.
 9. Use the screen reader to upload, replace, and remove a reference, select both reference modes, and return to general conversation. Verify upload errors, mode changes, and guided steps are understandable without inspecting the image preview.
 10. Test a reference with asymmetric makeup, a different pose, and poor lighting. Verify the assistant distinguishes the target look from the current face, reports uncertainty, and gives one usable step in guided mode. Confirm comparison mode describes differences without advancing that guided step.
+11. Check that the capture confirmation and waiting tones are audible but unobtrusive, stop when speech starts or the session pauses, and do not trigger microphone feedback. The capture cue confirms receipt of audio, not successful transcription.
 
-Playwright WebKit is not the branded Safari browser. Media behavior varies across operating systems, so automated WebKit success does not establish iPhone speech synthesis, VoiceOver, or permission compatibility. See [Playwright's browser documentation](https://playwright.dev/docs/browsers#webkit).
+Playwright WebKit is not the branded Safari browser. Media behavior varies across operating systems, so automated WebKit success does not establish iPhone audio output, VoiceOver, or permission compatibility. See [Playwright's browser documentation](https://playwright.dev/docs/browsers#webkit).
 
 ## Results
+
+### Local GPU voice and interaction cues
+
+- Docker production builds and TypeScript checking pass. All 202 application unit tests and 13 Python speech-service tests pass, covering PCM validation, bounded playback, cancellation, timeouts, cue cleanup, and the final-chunk queue race.
+- Four Chromium/WebKit checks pass through the simulated code-server proxy with real GPU Kokoro, real browser VAD, and real AudioWorklet playback. Only Argon and the camera/microphone input fixtures are mocked in this stack. Reports are at `artifacts/tts-real/playwright-report/index.html`.
+- The V100 runs ONNX Runtime's CUDA provider with cuDNN 9.10.2. Startup profiling confirms 3,976 CUDA node executions, including 544 compute nodes; missing GPU support fails readiness instead of silently falling back to CPU.
+- With four CPU threads and a warmed V100, a 17-word sentence has 134 ms median time to first PCM versus 1,027 ms on the CPU baseline. Ten previously unseen short instructions take 97–135 ms; a fresh-container first request takes 198 ms after readiness. These measurements exclude Argon, browser buffering, and speaker output. Samples and benchmark JSON are under `artifacts/tts/gpu/`.
+- The deployed code-server stack is healthy. Both prefixed and stripped health routes return 200, and the PCM worklet is served as JavaScript. A live Argon-to-GPU opening turn completes with valid ordered NDJSON and 474,912 PCM bytes: first audio at 10,990 ms, complete at 11,417 ms. This is one connectivity sample, with the model wait included, not an end-to-end latency guarantee.
+- Capture confirmation and processing cues are original synthesized tones. Capture confirmation means audio was received, not that transcription succeeded. Physical-device listening, speaker feedback, and screen-reader acceptance remain pending.
 
 ### Reference image and separate modes follow-up
 
