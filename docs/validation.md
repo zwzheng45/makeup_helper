@@ -9,19 +9,22 @@ For Linux WebKit, the synthetic camera playback and frame metadata are shimmed a
 The suite covers:
 
 - Production health and keyboard-accessible startup.
-- Automated accessibility checks on the initial page.
+- Automated accessibility checks (axe-core) on the setup page in light, dark and high-contrast themes, and on the mirror page before and after starting, including typed mode with large text and dark theme.
+- Setup choices following device preferences, being saved, applied on the mirror page before paint, and restored from Settings; reflow at 320 pixels with the largest text.
 - Real browser voice activity detection against synthesized speech.
 - A new audio turn with a current image, and spoken reply handling.
 - Interruption of an answer and rejection of obsolete responses.
-- Pause, resume, end, and stopped media tracks.
+- Mute keeping the camera live while nothing is sent, unmute, and a spoken "pause" muting instead of stopping.
+- Typed (nonverbal) mode requesting the camera only, sending typed questions, and conversation starters sent as typed questions in voice mode.
+- Read replies aloud off (shown and announced, never spoken) and talking speed applied to speech.
 - Permission denial, provider failure, and recovery.
-- Ending while permission or VAD loading is pending, including later resource cleanup.
+- Leaving the page while permission or VAD loading is pending, including later resource cleanup.
 - Speech playback errors and missing playback-start events, with audio reconnection.
-- Simulated backgrounding, page restoration, and explicit resume.
+- Simulated backgrounding and page restoration stopping capture, with Start mirror reconnecting.
 - Reference upload and removal, keyboard-accessible mode selection, and automated accessibility checks with a reference selected.
 - Synthetic JPEG, PNG, and WebP inputs normalized to bounded JPEG previews; unsupported, oversized, and unreadable files rejected.
 - A real VAD turn in guided mode carrying audio, a reference image, and a separately labelled current camera image.
-- Explicit resume after mode changes, independent conversations, guided progress retention, reference replacement, obsolete-answer rejection, and end-session clearing.
+- Mode changes in place without restarting the camera, independent conversations, guided progress retention, photo replacement restarting the mode, obsolete-answer rejection, and a spoken end clearing the session.
 
 Type checking and unit tests run in the same test container before browser tests. The production image is built from the lockfile and run without a development server. A test run is successful only when the test service exits with code zero; HTML reports and retained traces are exported to `artifacts/`.
 
