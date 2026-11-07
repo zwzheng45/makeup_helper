@@ -14,6 +14,9 @@ interface TestMedia {
   playbackMs: number;
   speaking: boolean;
   speechMode: "normal" | "error" | "silent";
+  /** What each getUserMedia call asked for, to prove typed mode never opens the microphone. */
+  requests: { audio: boolean; video: boolean }[];
+  rates: number[];
 }
 
 declare global {
@@ -26,7 +29,7 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
     const media: TestMedia = {
       streams: [], destinations: [], contexts: [], speech: [], canceled: [],
       denyPermission: false, holdPermission: false, pendingPermission: false,
-      playbackMs: 150, speaking: false, speechMode: "normal",
+      playbackMs: 150, speaking: false, speechMode: "normal", requests: [], rates: [],
     };
     window.__mirrorMedia = media;
     const cameraFrames = new Map<MediaStream, HTMLCanvasElement>();
@@ -87,17 +90,22 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: devices });
     Object.defineProperty(devices, "getUserMedia", {
       configurable: true,
-      value: async () => {
+      value: async (constraints?: MediaStreamConstraints) => {
+        const wantsAudio = Boolean(constraints?.audio);
+        media.requests.push({ audio: wantsAudio, video: Boolean(constraints?.video) });
         if (media.denyPermission) throw new DOMException("Permission denied", "NotAllowedError");
         const context = applicationContext;
-        if (!context) throw new Error("The application must create its audio context before requesting media.");
-        const destination = context.createMediaStreamDestination();
-        // Keep the synthetic microphone clock active before the speech fixture
-        // starts; an unconnected destination can stall WebKit's media pipeline.
-        const silence = context.createConstantSource();
-        silence.offset.value = 0;
-        silence.connect(destination);
-        silence.start();
+        if (wantsAudio && !context) throw new Error("The application must create its audio context before requesting media.");
+        let destination: MediaStreamAudioDestinationNode | undefined;
+        if (wantsAudio && context) {
+          destination = context.createMediaStreamDestination();
+          // Keep the synthetic microphone clock active before the speech fixture
+          // starts; an unconnected destination can stall WebKit's media pipeline.
+          const silence = context.createConstantSource();
+          silence.offset.value = 0;
+          silence.connect(destination);
+          silence.start();
+        }
         const canvas = document.createElement("canvas");
         canvas.width = 640;
         canvas.height = 480;
@@ -117,7 +125,7 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
         paint();
         const video = canvas.captureStream(20);
         const timer = window.setInterval(paint, 50);
-        const stream = new MediaStream([...video.getVideoTracks(), ...destination.stream.getAudioTracks()]);
+        const stream = new MediaStream([...video.getVideoTracks(), ...(destination?.stream.getAudioTracks() ?? [])]);
         cameraFrames.set(stream, canvas);
         const videoTrack = video.getVideoTracks()[0];
         const stop = videoTrack.stop.bind(videoTrack);
@@ -133,8 +141,10 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
           });
         }
         media.streams.push(stream);
-        media.contexts.push(context);
-        media.destinations.push(destination);
+        if (context && destination) {
+          media.contexts.push(context);
+          media.destinations.push(destination);
+        }
         return stream;
       },
     });
@@ -164,6 +174,7 @@ export async function installBrowserMedia(page: Page, fakeVideoPlayback = false)
         if (!utterance.text) return;
         active = utterance;
         media.speech.push(utterance.text);
+        media.rates.push(utterance.rate);
         media.speaking = true;
         if (media.speechMode === "silent") return;
         if (media.speechMode === "error") {
