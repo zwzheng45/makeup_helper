@@ -1,0 +1,52 @@
+# Use with compose.test.yaml. Both proxies share the app's network namespace,
+# matching a code-server port proxy that forwards to localhost without TLS.
+services:
+  app:
+    image: mirror:test-codeserver-app
+    build:
+      args:
+        NEXT_PUBLIC_BASE_PATH: /proxy/8443
+    environment:
+      NEXT_PUBLIC_BASE_PATH: /proxy/8443
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/proxy/8443/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+
+  codeserver-upstream:
+    image: caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    network_mode: service:app
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_PATH: /proxy/8443
+      APP_UPSTREAM: 127.0.0.1:3000
+    volumes:
+      - ./docker/Caddyfile.codeserver:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  codeserver-edge:
+    image: caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    network_mode: service:app
+    depends_on:
+      codeserver-upstream:
+        condition: service_healthy
+    volumes:
+      - ./tests/e2e/Caddyfile.codeserver:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/proxy/8443/api/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  test:
+    depends_on:
+      codeserver-edge:
+        condition: service_healthy
+    environment:
+      PLAYWRIGHT_BASE_URL: http://localhost:8081
+      PLAYWRIGHT_BASE_PATH: /proxy/8443
+    command: ["sh", "-c", "npm run typecheck && npm test && npx playwright test --grep 'production health|actual VAD'"]

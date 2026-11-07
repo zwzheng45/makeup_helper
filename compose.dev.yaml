@@ -1,0 +1,15 @@
+services:
+  app:
+    image: mirror:development
+    build:
+      target: development
+    environment:
+      NODE_ENV: development
+    volumes:
+      - .:/app
+      - development_dependencies:/app/node_modules
+    tmpfs:
+      - /app/.vinext:uid=1000,gid=1000,mode=0755
+
+volumes:
+  development_dependencies:

@@ -1,0 +1,5 @@
+{$APP_HOST:localhost}:443 {
+    tls internal
+    encode zstd gzip
+    reverse_proxy app:3000
+}

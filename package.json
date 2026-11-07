@@ -1,0 +1,44 @@
+{
+  "name": "mirror",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "assets": "node scripts/copy-vad-assets.mjs",
+    "dev": "npm run assets && vinext dev --hostname 0.0.0.0 --port 3000",
+    "build": "npm run assets && vinext build",
+    "start": "node dist/standalone/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "test:live": "node scripts/smoke-gemini.mjs"
+  },
+  "dependencies": {
+    "@ricky0123/vad-web": "0.0.31",
+    "next": "16.3.4",
+    "onnxruntime-web": "1.31.1",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "react-server-dom-webpack": "19.2.6",
+    "vinext": "1.0.0-beta.5",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.64.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "typescript": "5.9.3",
+    "vite": "8.0.13",
+    "vitest": "5.1.0"
+  },
+  "overrides": {
+    "playwright-core": "1.64.1"
+  }
+}

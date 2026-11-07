@@ -1,0 +1,16 @@
+# code-server terminates HTTPS and strips /proxy/<port>/ before forwarding HTTP.
+services:
+  app:
+    build:
+      args:
+        NEXT_PUBLIC_BASE_PATH: ${CODE_SERVER_BASE_PATH:-/proxy/8443}
+    environment:
+      NEXT_PUBLIC_BASE_PATH: ${CODE_SERVER_BASE_PATH:-/proxy/8443}
+
+  caddy:
+    environment:
+      APP_BASE_PATH: ${CODE_SERVER_BASE_PATH:-/proxy/8443}
+    ports: !override
+      - "127.0.0.1:${CODE_SERVER_PORT:-8443}:8080"
+    volumes:
+      - ./docker/Caddyfile.codeserver:/etc/caddy/Caddyfile:ro

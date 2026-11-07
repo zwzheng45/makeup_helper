@@ -1,0 +1,55 @@
+# This is a standalone, isolated test stack. It never reads .env.local.
+services:
+  mock-gemini:
+    image: node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+    init: true
+    working_dir: /app
+    command: ["node", "tests/e2e/mock-gemini.mjs"]
+    volumes:
+      - ./tests/e2e/mock-gemini.mjs:/app/tests/e2e/mock-gemini.mjs:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  app:
+    image: mirror:test-app
+    build:
+      context: .
+      target: production
+    init: true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      GEMINI_PROXY_KEY: test-key-never-a-real-credential
+      GEMINI_PROXY_BASE_URL: http://mock-gemini:8080/v1beta
+      GEMINI_MODEL: gemini-4-argon
+    depends_on:
+      mock-gemini:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      start_period: 15s
+      retries: 20
+
+  test:
+    image: mirror:test-runner
+    build:
+      context: .
+      target: test
+    init: true
+    ipc: host
+    network_mode: service:app
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      CI: "1"
+      PLAYWRIGHT_BASE_URL: http://localhost:3000
+      MOCK_GEMINI_URL: http://mock-gemini:8080
+    volumes:
+      - ./artifacts:/app/artifacts

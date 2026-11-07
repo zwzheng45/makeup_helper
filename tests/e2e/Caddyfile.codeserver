@@ -1,0 +1,18 @@
+{
+	admin off
+	auto_https off
+}
+
+:8081 {
+	# Match code-server's default /proxy/<port>/ route, which strips the
+	# prefix before forwarding to the target port.
+	handle_path /proxy/8443/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# Escaped application assets must fail, rather than accidentally loading
+	# from another route at the code-server origin.
+	handle {
+		respond "Not found" 404
+	}
+}

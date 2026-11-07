@@ -1,0 +1,11 @@
+{
+	admin off
+}
+
+:8080 {
+	encode zstd gzip
+	# Accept code-server's stripped paths and direct requests with the prefix.
+	@needsPrefix not path {$APP_BASE_PATH} {$APP_BASE_PATH}/*
+	rewrite @needsPrefix {$APP_BASE_PATH}{uri}
+	reverse_proxy {$APP_UPSTREAM:app:3000}
+}
