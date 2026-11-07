@@ -54,31 +54,3 @@ export function captureFrame(video: HTMLVideoElement, lastFrameAt: number): Came
 export function stopMedia(stream: MediaStream | null): void {
   stream?.getTracks().forEach((track) => track.stop());
 }
-
-export async function englishVoice(): Promise<SpeechSynthesisVoice> {
-  if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
-    throw new Error("Spoken replies are not available in this browser. Try Safari or Chrome, then start again.");
-  }
-  const find = () => {
-    const voices = window.speechSynthesis.getVoices();
-    return voices.find((voice) => voice.lang === "en-GB") ?? voices.find((voice) => voice.lang.startsWith("en"));
-  };
-  const available = find();
-  if (available) return available;
-  return new Promise((resolve, reject) => {
-    const finish = () => {
-      const voice = find();
-      if (voice) {
-        clearTimeout(timeout);
-        window.speechSynthesis.removeEventListener("voiceschanged", finish);
-        resolve(voice);
-      }
-    };
-    const timeout = window.setTimeout(() => {
-      window.speechSynthesis.removeEventListener("voiceschanged", finish);
-      reject(new Error("An English speaking voice is not available yet. Check your device's speech voices, then reconnect audio."));
-    }, 3000);
-    window.speechSynthesis.addEventListener("voiceschanged", finish);
-    finish();
-  });
-}

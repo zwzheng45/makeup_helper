@@ -49,4 +49,4 @@ services:
     environment:
       PLAYWRIGHT_BASE_URL: http://localhost:8081
       PLAYWRIGHT_BASE_PATH: /proxy/8443
-    command: ["sh", "-c", "npm run typecheck && npm test && npx playwright test --grep 'production health|actual VAD|reference selection|reference guided voice turn'"]
+    command: ["sh", "-c", "npm run typecheck && npm test && npx playwright test --grep 'production health|actual VAD|reference selection|reference guided voice turn|local voice plays PCM'"]

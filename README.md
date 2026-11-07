@@ -2,15 +2,16 @@
 
 Mirror is a voice-first grooming assistant for blind and low-vision users. Start the mirror once, allow the camera and microphone, and ask questions naturally. The browser detects when a sentence ends, sends that audio and a current camera image to Gemini, and speaks the answer.
 
-This prototype uses automatic conversational turns through `generateContent`. It does not use Gemini Live or continuously upload video. Responses take a round trip to the configured Gemini proxy. Spoken replies use an English voice supplied by the browser or operating system.
+This prototype uses automatic conversational turns through `generateContent`. It does not use Gemini Live or continuously upload video. Responses take a round trip to the configured Gemini proxy and are validated in full before speech generation. A local Kokoro service then synthesizes short English phrases; the browser plays the returned PCM audio through Web Audio.
 
 Upload a reference makeup image to use either of two separate reference modes: guided steps toward the look, or a comparison with your current appearance. General conversation remains available without a reference.
 
 ## Requirements
 
 - Docker Engine or Docker Desktop with Docker Compose v2.24.4 or later.
-- A recent Chrome or Safari browser, camera, microphone, and an English speech voice.
+- A recent Chrome or Safari browser with AudioWorklet support, camera, microphone, and audio output.
 - A Gemini proxy key with access to the configured model.
+- An NVIDIA GPU with a CUDA 12.6-compatible driver and NVIDIA Container Toolkit configured for Docker. The speech image targets Linux amd64, reserves one GPU, and allows four CPU cores and 2 GiB host RAM. No cloud TTS key is required.
 
 Node.js, npm, model assets, and test browsers run inside containers. No host Node.js installation is required. Camera and microphone access happens in the visitor's browser; containers do not need camera device mounts.
 
@@ -23,6 +24,8 @@ Copy `.env.example` to `.env.local`, then set `GEMINI_PROXY_KEY`. Keep the file 
 | `GEMINI_PROXY_KEY` | Server-only proxy credential | Required |
 | `GEMINI_PROXY_BASE_URL` | Gemini-compatible API base URL | Supplied project proxy |
 | `GEMINI_MODEL` | Model used for each conversational turn | `gemini-4-argon` |
+| `TTS_BASE_URL` | Server-only URL of the internal speech service | `http://tts:8000` |
+| `TTS_THREADS` | ONNX host-side inference threads, with a four-core container limit | `4` |
 | `APP_HOST` | Hostname or LAN IP on the HTTPS certificate | `localhost` |
 | `HTTPS_PORT` | Published HTTPS port | `8443` |
 | `BIND_ADDRESS` | Host interface on which HTTPS is published | `127.0.0.1` |
@@ -42,7 +45,7 @@ docker compose --env-file .env.local ps
 
 Open `https://localhost:8443`. Before using camera or microphone access, trust the local HTTPS certificate as described in [Local HTTPS and phone testing](docs/local-https.md).
 
-The application runs as a non-root Node.js process from Vinext's standalone production output. Caddy provides HTTPS. The app's `/api/health` endpoint is checked before the proxy starts. This command runs locally; it does not publish a public website or provision external hosting.
+The application runs as a non-root Node.js process from Vinext's standalone production output. Caddy provides HTTPS. The app waits for the local speech service to load and warm its model, and the app's `/api/health` endpoint is checked before the proxy starts. This command runs locally; it does not publish a public website or provision external hosting.
 
 ```sh
 docker compose --env-file .env.local logs --tail=100 app caddy
@@ -84,6 +87,8 @@ docker compose --env-file .env.local -f compose.yaml -f compose.dev.yaml up --bu
 
 Source files are mounted into the development container. Dependencies use a named Docker volume; startup compares the lockfile hash and runs `npm ci` whenever it changes. Vinext's temporary cache and process lock live in a container-local `tmpfs`, preventing stale locks from crossing container restarts. Assets for local voice detection are copied automatically before the dev server starts. Caddy forwards regular requests and hot-reload WebSocket connections.
 
+The development override also mounts `services/tts/` into the speech container. After changing its Python files, restart `tts` with the same Compose file combination. Model files remain in the image and are not downloaded when the service restarts.
+
 Run development commands in the same container:
 
 ```sh
@@ -102,6 +107,17 @@ docker compose -p mirror-test -f compose.test.yaml down
 
 The standalone test configuration does not load `.env.local`. It supplies a fake key and a local mock Gemini HTTP service. Tests exercise the same production application image used for deployment, and the runner performs type checking, unit tests, and Playwright tests. Reports and failure traces are written to `artifacts/`.
 
+When running isolated stacks concurrently, set a different `MIRROR_TEST_ARTIFACTS` directory for each one so their Playwright reports and traces do not overwrite each other.
+
+The standard suite uses deterministic PCM fixtures and does not require a GPU. To additionally connect the production app and real browser AudioWorklet to the GPU speech service, run the following isolated integration stack. Gemini stays mocked, so this consumes no provider quota:
+
+```sh
+docker compose -p mirror-real-tts-test -f compose.test.yaml -f compose.test.tts.yaml up --build --abort-on-container-exit --exit-code-from test
+docker compose -p mirror-real-tts-test -f compose.test.yaml -f compose.test.tts.yaml down
+```
+
+This integration check requires an NVIDIA GPU and the NVIDIA Container Toolkit, just like deployment.
+
 To test the code-server deployment, use the isolated proxy override. It places a prefix-stripping HTTP proxy in front of the same Caddy configuration used for deployment, and checks page startup, a spoken turn, reference selection, and a guided reference turn in both browsers:
 
 ```sh
@@ -109,7 +125,7 @@ docker compose -p mirror-codeserver-test -f compose.test.yaml -f compose.test.co
 docker compose -p mirror-codeserver-test -f compose.test.yaml -f compose.test.codeserver.yaml down
 ```
 
-Playwright runs Chromium and WebKit in its official, version-matched image. Browser device input is simulated, but the voice activity detector and WAV processing run normally against a synthesized English speech fixture. Speech synthesis is mocked to inspect playback and cancellation deterministically. No personal recordings or live Gemini quota are used by the automated suite.
+Playwright runs Chromium and WebKit in its official, version-matched image. Browser device input is simulated, but the voice activity detector and WAV processing run normally against a synthesized English speech fixture. Deterministic speech-service fixtures supply PCM audio; playback tests exercise the real AudioWorklet queue and sample output. No personal recordings or live Gemini quota are used by the automated suite. The local service's own Docker tests and real-model benchmark are described in [services/tts/README.md](services/tts/README.md).
 
 Real browser audio, external speaker feedback, screen readers, and iOS permissions still require device testing. See [Validation](docs/validation.md) for coverage and the manual checklist.
 
@@ -145,12 +161,17 @@ For the direct local HTTPS stack, omit the code-server override and use `http://
 
 - `Start mirror` requests permission and provides a brief framing check.
 - Speak without holding a button. New speech interrupts a current answer.
+- Quiet local tones acknowledge a captured sentence and indicate that the assistant is processing. These cues are generated with Web Audio; they do not use the device's speech voice or a TTS request.
 - `Stop talking` cancels the answer while leaving the microphone active.
 - `Pause mirror` stops camera, microphone, and playback. Use `Resume mirror` to reconnect.
 - `End session` also clears the reference image, all mode histories, and guided progress. Moving the page to the background pauses capture.
 - Preview video is mirrored; images sent to Gemini are not. Directions refer to the user's own left and right.
 
 The application keeps at most ten conversational turns per mode in browser memory and does not save recordings or transcripts to a database. Audio and current images are sent through the configured proxy to Gemini. Reference modes also send the prepared reference image; guided mode includes the current step and a short progress summary. Provider retention is governed by the proxy and upstream service, not by this application. Only English interface copy and responses are included in this MVP.
+
+Validated reply text is sent to the local speech container. It uses full-precision Kokoro-82M v1.0 with the fixed `af_heart` voice at speed 1.0 and ONNX Runtime's CUDA provider. Both model and voices are downloaded and SHA256-verified during the Docker build, then bundled in the image. Startup verifies real CUDA model computation during warmup and refuses to silently fall back to CPU. The runtime has no published port or external network access. It keeps one inference active and at most one request waiting; extra requests receive a busy response. A cancellation immediately discards obsolete output, while an already-running ONNX operation finishes before its execution slot is reused.
+
+Local speech removes a cloud TTS round trip, but total response time still includes the Gemini proxy's complete answer and the first phrase's synthesis. It does not guarantee a response within 500 ms. Measurements must distinguish first PCM arrival, leading low-level audio, the browser's playback buffer, and the user's actual device output.
 
 ## Use a reference look
 
@@ -172,6 +193,7 @@ Replacing the reference pauses capture and clears reference-related histories an
 
 - `app/`: interface and same-origin API routes.
 - `lib/`: request contracts, media/session logic, and Gemini integration.
+- `services/tts/`: offline GPU speech service, pinned model manifest, dependency locks, service tests, and timing benchmark.
 - `docker/` and `compose*.yaml`: container development, HTTPS, deployment, and tests.
 - `tests/`: unit and end-to-end tests.
 - `docs/`: local HTTPS setup and validation notes.
