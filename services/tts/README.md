@@ -1,6 +1,6 @@
 # Local speech service
 
-This internal Docker service uses `kokoro-onnx==0.6.1`, full-precision Kokoro-82M v1.0, and the fixed English `af_heart` voice at speed 1.0. ONNX Runtime executes the model on an NVIDIA GPU. The service returns mono 24 kHz PCM16LE without a WAV header; it uses neither a cloud TTS API nor the operating system's speech synthesis.
+This internal Docker service uses `kokoro-onnx==0.6.1`, full-precision Kokoro-82M v1.0, and the fixed English `af_heart` voice at normal speed (1.0) unless the request asks for slow or fast speech. ONNX Runtime executes the model on an NVIDIA GPU. The service returns mono 24 kHz PCM16LE without a WAV header; it uses neither a cloud TTS API nor the operating system's speech synthesis.
 
 ## Build and startup
 
@@ -20,7 +20,7 @@ The image pins `onnxruntime-gpu==1.20.2`, CUDA 12.6 runtime libraries, and `nvid
 {"text":"Keep your face in view."}
 ```
 
-Only the `text` property is accepted. It must contain 1–1000 characters. Long input is separated into bounded phrases; no voice selection or voice cloning is exposed.
+An optional `speed` property selects the talking speed set on Mirror's setup page: `0.8` (slow), `1` (normal, the default) or `1.25` (fast), for example `{"text":"Keep your face in view.","speed":0.8}`. No other properties or speeds are accepted. `text` must contain 1–1000 characters. Long input is separated into bounded phrases; no voice selection or voice cloning is exposed.
 
 A successful response has `Content-Type: audio/pcm; rate=24000; channels=1`, `X-PCM-Format: s16le`, and HTTP chunked transfer. Success headers are sent only after the first nonempty PCM chunk exists. Invalid input returns 400, incorrect content type returns 415, and a full queue or expired waiting slot returns 503. An inference failure before audio returns 500; failure after headers closes an incomplete chunked response so callers detect truncation.
 

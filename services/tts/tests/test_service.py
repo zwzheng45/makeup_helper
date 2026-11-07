@@ -19,10 +19,12 @@ class ControlledEngine:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.calls = []
+        self.speeds = []
         self.fail = fail
 
-    def chunks(self, text):
+    def chunks(self, text, speed=1.0):
         self.calls.append(text)
+        self.speeds.append(speed)
         self.entered.set()
         if not self.release.wait(3):
             raise RuntimeError("Test release timed out")
@@ -77,7 +79,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_canceling_backpressure_stops_producing(self):
         class ManyChunks:
-            def chunks(self, _):
+            def chunks(self, _, speed=1.0):
                 for _ in range(1000):
                     yield PCM
         scheduler = Scheduler(ManyChunks())
@@ -176,7 +178,7 @@ class HttpTests(unittest.TestCase):
 
     def test_failed_stream_is_truncated_not_reported_as_complete(self):
         class PartialFailure:
-            def chunks(self, _):
+            def chunks(self, _, speed=1.0):
                 yield PCM
                 raise RuntimeError("Synthetic mid-stream failure")
         self.scheduler.engine = PartialFailure()
@@ -205,8 +207,8 @@ class HttpTests(unittest.TestCase):
 
         original_submit = self.scheduler.submit
 
-        def submit(text):
-            job = original_submit(text)
+        def submit(text, speed=1.0):
+            job = original_submit(text, speed)
             job.output = CompletionRaceQueue(job.done)
             self.engine.release.set()
             return job
@@ -218,7 +220,9 @@ class HttpTests(unittest.TestCase):
         connection.close()
 
     def test_invalid_inputs_are_rejected_before_inference(self):
-        for body in ["broken", "[]", '{}', '{"text":""}', '{"text":1}', '{"text":"hello","voice":"other"}', json.dumps({"text": "x" * 1001})]:
+        invalid_speeds = ['{"text":"hello","speed":true}', '{"text":"hello","speed":"1"}', '{"text":"hello","speed":NaN}',
+                          '{"text":"hello","speed":Infinity}', '{"text":"hello","speed":0.5}', '{"text":"hello","speed":null}', '{"speed":1}']
+        for body in ["broken", "[]", '{}', '{"text":""}', '{"text":1}', '{"text":"hello","voice":"other"}', json.dumps({"text": "x" * 1001}), *invalid_speeds]:
             with self.subTest(body=body[:50]):
                 connection, response = self.request(body)
                 self.assertEqual(response.status, 400)
@@ -228,6 +232,16 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(response.status, 415)
         connection.close()
         self.assertEqual(self.engine.calls, [])
+
+    def test_offered_speeds_reach_inference_and_default_is_normal(self):
+        self.engine.release.set()
+        for body, expected in [({"text": "Normal."}, 1.0), ({"text": "Slow.", "speed": 0.8}, 0.8), ({"text": "Fast.", "speed": 1.25}, 1.25), ({"text": "One.", "speed": 1}, 1.0)]:
+            with self.subTest(body=body):
+                connection, response = self.request(json.dumps(body))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), PCM)
+                connection.close()
+                self.assertEqual(self.engine.speeds[-1], expected)
 
     def test_waiting_timeout_cancels_queued_request(self):
         self.server.queue_timeout = 0.05

@@ -2,6 +2,12 @@ export type MirrorAction = "reply" | "stop" | "pause" | "end";
 export interface HistoryTurn { user: string; assistant: string; interrupted?: boolean }
 export interface CameraFrame { data: string; mimeType: "image/jpeg"; capturedAt: number }
 export type MirrorMode = "general" | "guided" | "compare";
+/** Talking speeds offered in settings: slow, normal and fast. */
+export const SPEECH_RATES = [0.8, 1, 1.25] as const;
+export type SpeechRate = typeof SPEECH_RATES[number];
+export function isSpeechRate(value: unknown): value is SpeechRate {
+  return SPEECH_RATES.includes(value as SpeechRate);
+}
 export interface ReferenceImage { data: string; mimeType: "image/jpeg" }
 export interface GuidanceContext {
   goal: string;
@@ -13,6 +19,10 @@ export interface TurnRequest {
   turnId: number;
   opening?: boolean;
   audio?: string;
+  /** A typed question, sent instead of audio. */
+  text?: string;
+  /** Speed for the spoken reply. Omitted means normal speed. */
+  speechRate?: SpeechRate;
   frame?: CameraFrame;
   mode?: MirrorMode;
   reference?: ReferenceImage;

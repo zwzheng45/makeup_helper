@@ -13,6 +13,7 @@ class BusyError(Exception):
 @dataclass(eq=False)
 class Job:
     text: str
+    speed: float = 1.0
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
     output: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
@@ -31,13 +32,13 @@ class Scheduler:
         self.worker = threading.Thread(target=self._work, name="kokoro-inference", daemon=True)
         self.worker.start()
 
-    def submit(self, text: str) -> Job:
+    def submit(self, text: str, speed: float = 1.0) -> Job:
         with self.condition:
             # The first pending item reserves the execution slot if the worker
             # has not picked it up yet. Only one additional item may wait.
             if self.closed or len(self.pending) + (self.running is not None) >= 2:
                 raise BusyError()
-            job = Job(text)
+            job = Job(text, speed)
             self.pending.append(job)
             self.condition.notify_all()
             return job
@@ -66,7 +67,7 @@ class Scheduler:
                 self.running = job
                 job.started_at = time.monotonic()
             try:
-                iterator = iter(self.engine.chunks(job.text))
+                iterator = iter(self.engine.chunks(job.text, job.speed))
                 while not job.canceled.is_set():
                     try:
                         chunk = next(iterator)

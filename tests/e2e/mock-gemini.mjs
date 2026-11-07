@@ -38,6 +38,7 @@ async function tts(response, body) {
   const options = plan?.options ?? {};
   const record = {
     text,
+    speed: body.speed ?? null,
     receivedAt: Date.now(), firstChunkAt: null, sentChunks: 0,
     completed: false, canceled: false, inferenceId: plan?.inferenceId ?? null,
   };
@@ -105,6 +106,8 @@ createServer(async (request, response) => {
     const body = await readJson(request);
     const parts = body.contents?.at(-1)?.parts ?? [];
     const opening = parts.some((part) => part.text?.startsWith("Opening camera check."));
+    const typedPrefix = "Typed message from the user: ";
+    const typedText = parts.find((part) => part.text?.startsWith(typedPrefix))?.text.slice(typedPrefix.length) ?? null;
     const mode = parts.map((part) => part.text ?? "").join("\n").match(/Mode: (general|guided|compare)\./)?.[1] ?? "general";
     const contextText = parts.find((part) => part.text?.startsWith("Guidance context: {"))?.text;
     const guidanceContext = contextText ? JSON.parse(contextText.slice("Guidance context: ".length)) : null;
@@ -132,6 +135,7 @@ createServer(async (request, response) => {
       receivedAt: Date.now(),
       hasAudio: parts.some((part) => part.inlineData?.mimeType === "audio/wav"),
       hasImage: parts.some((part) => part.inlineData?.mimeType === "image/jpeg"),
+      typedText,
       completed: false,
       canceled: false,
     };
@@ -144,7 +148,7 @@ createServer(async (request, response) => {
       return json(response, override.status, { error: { message: "Simulated upstream failure" } });
     }
     const generalAnswer = {
-      transcript: opening ? "" : "Please look at my hair and tell me what you can see.",
+      transcript: opening ? "" : typedText ?? "Please look at my hair and tell me what you can see.",
       reply: opening ? "Your camera is ready. What would you like help with?" : "Your hair is swept to your right. I can help you check it again.",
       action: "reply",
     };

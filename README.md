@@ -1,15 +1,17 @@
 # Mirror
 
-Mirror is a voice-first grooming assistant for blind and low-vision users. Start the mirror once, allow the camera and microphone, and ask questions naturally. The browser detects when a sentence ends, sends that audio and a current camera image to Gemini, and speaks the answer.
+Mirror is a grooming assistant built for disabled people, including blind, low-vision and nonverbal users. A short setup page comes first; then the camera fills the screen. Ask questions out loud, or type them, and Mirror answers using a current camera image. Replies are shown as text and, unless turned off, spoken.
 
 This prototype uses automatic conversational turns through `generateContent`. It does not use Gemini Live or continuously upload video. Responses take a round trip to the configured Gemini proxy and are validated in full before speech generation. A local Kokoro service then synthesizes short English phrases; the browser plays the returned PCM audio through Web Audio.
 
-Upload a reference makeup image to use either of two separate reference modes: guided steps toward the look, or a comparison with your current appearance. General conversation remains available without a reference.
+Add a photo of a makeup look to use either of two reference modes: a longer step-by-step guide toward the look, or a quick check against your current appearance. Ask anything remains available without a photo.
+
+The interface targets WCAG 2.2 level AA and follows the visitor's own browser and device settings. See [Setup and accessibility](#setup-and-accessibility).
 
 ## Requirements
 
 - Docker Engine or Docker Desktop with Docker Compose v2.24.4 or later.
-- A recent Chrome or Safari browser with AudioWorklet support, camera, microphone, and audio output.
+- A recent Chrome or Safari browser with AudioWorklet support and a camera. Voice mode also needs a microphone; spoken replies need audio output.
 - A Gemini proxy key with access to the configured model.
 - An NVIDIA GPU with a CUDA 12.6-compatible driver and NVIDIA Container Toolkit configured for Docker. The speech image targets Linux amd64, reserves one GPU, and allows four CPU cores and 2 GiB host RAM. No cloud TTS key is required.
 
@@ -159,13 +161,36 @@ For the direct local HTTPS stack, omit the code-server override and use `http://
 
 ## Interaction and data flow
 
-- `Start mirror` requests permission and provides a brief framing check.
-- Speak without holding a button. New speech interrupts a current answer.
+- The setup page (`/`) opens first. `Save and continue` opens the mirror (`/mirror`); choosing nothing gives the standard voice mirror. `Settings` on the mirror page returns to setup. Leaving the mirror page turns the camera and microphone off and clears its conversation and photo.
+- `Start mirror` requests permission and provides a brief framing check. The camera then fills the page behind the controls.
+- Voice mode: speak without holding a button. New speech interrupts a current answer. `Mute microphone` keeps the camera on but sends nothing until `Unmute microphone`. Saying "pause" or "stop listening" also mutes.
+- Nonverbal mode never requests the microphone. Type in `Your question` and press `Send` or Enter.
+- Replies are spoken by the local speech service at the talking speed chosen in setup. With `Read replies aloud` off, the server answers in plain JSON and no speech is synthesized.
 - Quiet local tones acknowledge a captured sentence and indicate that the assistant is processing. These cues are generated with Web Audio; they do not use the device's speech voice or a TTS request.
-- `Stop talking` cancels the answer while leaving the microphone active.
-- `Pause mirror` stops camera, microphone, and playback. Use `Resume mirror` to reconnect.
-- `End session` also clears the reference image, all mode histories, and guided progress. Moving the page to the background pauses capture.
+- In either mode, the suggested questions under the reply are sent as typed questions. In step-by-step mode, "Done, next step" confirms the current step.
+- `Finish` ends the session (camera and microphone off, conversation and photo cleared) and returns to the setup page. There is no pause button: otherwise capture stops only when the page moves to the background or a device is lost, and `Start mirror` reconnects. Saying "stop" cancels a spoken answer, and saying "end session" ends the session in place.
 - Preview video is mirrored; images sent to Gemini are not. Directions refer to the user's own left and right.
+
+## Setup and accessibility
+
+| Setting | Choices | Starts from |
+| --- | --- | --- |
+| How will you use Mirror? | Blind or low vision; Nonverbal (type instead). Pick one, both or neither. | Neither |
+| Text size | Default, Large (125%), Larger (150%) | The browser's own text size |
+| Contrast | Standard, High | The device's `prefers-contrast` setting |
+| Theme | Auto, Light, Dark | Auto follows `prefers-color-scheme` |
+| Read replies aloud | On, Off | On |
+| Talking speed | Slow, Normal, Fast | Normal |
+
+Choices are saved in this browser's `localStorage` only and are applied by a small script in `<head>` before the page paints. A contrast choice that matches the device is stored as automatic, so later device changes are still followed. If storage is blocked, the choices are carried in the mirror page's address instead.
+
+Accessibility behaviour:
+
+- All sizes use `rem`, so browser zoom, the browser's default font size and the Text size setting all scale the whole interface. The fixed full-screen layout returns to normal page flow at narrow widths, large text or zoom, and reflows without horizontal scrolling at 320 CSS pixels.
+- Windows high contrast (`forced-colors`) and `prefers-reduced-motion` are supported. Every control is a native button, link, checkbox, radio or text field with a visible label and a visible two-tone focus ring, at least 44 pixels tall.
+- With Read replies aloud off, the reply is announced through a polite live region instead of being spoken, so screen-reader users hear it once. Status changes such as mute are announced in a status region, and errors in an alert.
+- When the controls swap after Start or after capture stops, keyboard focus moves to the next control instead of being lost.
+- Automated tests run axe-core on both pages in light, dark and high-contrast themes.
 
 The application keeps at most ten conversational turns per mode in browser memory and does not save recordings or transcripts to a database. Audio and current images are sent through the configured proxy to Gemini. Reference modes also send the prepared reference image; guided mode includes the current step and a short progress summary. Provider retention is governed by the proxy and upstream service, not by this application. Only English interface copy and responses are included in this MVP.
 
@@ -175,24 +200,24 @@ Local speech removes a cloud TTS round trip, but total response time still inclu
 
 ## Use a reference look
 
-Choose a JPEG, PNG, or WebP image with `Upload reference`. The original file must be no larger than 10 MiB. The browser prepares a JPEG with a longest edge of at most 1280 pixels and a size of at most 512 KiB; the original file is not uploaded. The image stays in page memory until removed, replaced, the session ends, or the page reloads. Pausing keeps it available.
+Choose a JPEG, PNG, or WebP image with `Add photo` at the top of the mirror page. The original file must be no larger than 10 MiB. The browser prepares a JPEG with a longest edge of at most 1280 pixels and a size of at most 512 KiB; the original file is not uploaded. The image stays in page memory until removed, replaced, the session ends, or the page reloads.
 
-| Mode | Behavior |
+| Mode (internal name) | Behavior |
 | --- | --- |
-| General conversation | Answers everyday grooming questions using your current camera view. An uploaded reference is not sent in this mode. |
-| Guided makeup | Introduces the reference look, clarifies your target and available products, then gives one step at a time and keeps progress across turns. |
-| Compare with reference | Describes visible differences between the reference and your current camera view without continuing the guided sequence. |
+| Ask anything (`general`) | Answers everyday grooming questions using your current camera view. An uploaded photo is not sent in this mode. |
+| Step-by-step guide (`guided`) | The longer mode. Introduces the look, clarifies your target and available products, then gives one step at a time and keeps progress across turns. |
+| Quick check (`compare`) | The quick mode. Describes visible differences between the photo and your current camera view without continuing the guided sequence. |
 
-The two reference modes become available after an image is ready. Choose the mode, then start the mirror. Changing mode during a session pauses camera, microphone, and playback; use `Resume mirror` to begin in the selected mode. Each mode keeps its own conversation, so returning to guided makeup retains its step and progress.
+The mode choices appear once a photo is ready. They can be changed before or during a session. Changing mode keeps the camera running, discards any answer still in progress for the old mode, and immediately opens the new one. Each mode keeps its own conversation, so returning to the step-by-step guide retains its step and progress.
 
-In guided mode, say "done" or "next step" when the current step is finished. Asking a question does not confirm completion. The server preserves the current step until it receives an explicit confirmation, and records the completed step in the progress summary.
+In step-by-step mode, say or type "done" or "next step" when the current step is finished. Asking a question does not confirm completion. The server preserves the current step until it receives an explicit confirmation, and records the completed step in the progress summary.
 
-Replacing the reference pauses capture and clears reference-related histories and progress. Removing it returns to general conversation. Neither action automatically restarts the camera or microphone. `End session` clears every mode's conversation and the reference image. The reference and current camera image are labelled separately in requests so the assistant can distinguish the desired look from what is currently visible.
+Replacing the photo clears photo-related histories and progress, rejects any answer about the old photo, and restarts the current mode with the new one. Removing it returns to Ask anything. Neither action turns the camera off. The photo and current camera image are labelled separately in requests so the assistant can distinguish the desired look from what is currently visible.
 
 ## Project structure
 
-- `app/`: interface and same-origin API routes.
-- `lib/`: request contracts, media/session logic, and Gemini integration.
+- `app/`: setup page (`app/page.tsx`), full-screen mirror page (`app/mirror/`), shared styles, and same-origin API routes.
+- `lib/`: request contracts, saved settings, media/session logic, and Gemini integration.
 - `services/tts/`: offline GPU speech service, pinned model manifest, dependency locks, service tests, and timing benchmark.
 - `docker/` and `compose*.yaml`: container development, HTTPS, deployment, and tests.
 - `tests/`: unit and end-to-end tests.

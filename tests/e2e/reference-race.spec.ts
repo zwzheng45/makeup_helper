@@ -59,43 +59,42 @@ test.beforeEach(async ({ page, request, browserName }) => {
     const revokeObjectURL = URL.revokeObjectURL.bind(URL);
     URL.revokeObjectURL = (url) => { control.revoked.push(url); revokeObjectURL(url); };
   });
-  await page.goto(appPath("/"));
+  await page.goto(appPath("/mirror"));
 });
 
 test("reference selection keeps the newest image when an older decode finishes later", async ({ page }) => {
-  const input = page.getByLabel("Reference makeup image", { exact: true });
+  const input = page.getByLabel(/^(Add|Change) photo$/);
   const first = await imageFile(page, "first-look.png", "#d13e52");
   const latest = await imageFile(page, "latest-look.png", "#355ec9");
   await page.evaluate(() => { window.__referenceDecode.holdNext = true; });
   await input.setInputFiles(first);
   await expect.poll(() => page.evaluate(() => Boolean(window.__referenceDecode.release))).toBe(true);
-  await expect(page.getByText("Preparing your reference image…", { exact: true })).toBeVisible();
+  await expect(page.getByText("Preparing your photo…", { exact: true })).toBeVisible();
 
   await input.setInputFiles(latest);
-  await expect(page.getByText("Reference ready: latest-look.png", { exact: true })).toBeVisible();
-  const preview = page.getByRole("img", { name: "Reference makeup look", exact: true });
+  await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toBeVisible();
+  const preview = page.getByRole("img", { name: "Your look photo", exact: true });
   const newestPreview = await preview.getAttribute("src");
   await releaseHeldImage(page);
 
-  await expect(page.getByText("Reference ready: latest-look.png", { exact: true })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toBeVisible();
   await expect(preview).toHaveAttribute("src", newestPreview!);
   await expect(page.getByText("first-look.png", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("radio", { name: "General conversation", exact: true })).toBeChecked();
+  await expect(page.getByRole("radio", { name: "Ask anything", exact: true })).toBeChecked();
   expect(await page.evaluate(() => window.__mirrorMedia.streams.length)).toBe(0);
 });
 
-test("reference selection cannot restore an image after end while decoding", async ({ page }) => {
+test("removing a photo while it is still being prepared discards it", async ({ page }) => {
   const image = await imageFile(page, "pending-look.png", "#a84575");
   await page.evaluate(() => { window.__referenceDecode.holdNext = true; });
-  await page.getByLabel("Reference makeup image", { exact: true }).setInputFiles(image);
+  await page.getByLabel(/^(Add|Change) photo$/).setInputFiles(image);
   await expect.poll(() => page.evaluate(() => Boolean(window.__referenceDecode.release))).toBe(true);
-  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await page.getByRole("button", { name: "Remove photo", exact: true }).click();
   await releaseHeldImage(page);
 
-  await expect(page.getByRole("img", { name: "Reference makeup look", exact: true })).toHaveCount(0);
-  await expect(page.getByText("Preparing your reference image…", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("radio", { name: "General conversation", exact: true })).toBeChecked();
-  await expect(page.getByRole("radio", { name: "Guided makeup", exact: true })).toBeDisabled();
+  await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toHaveCount(0);
+  await expect(page.getByText("Preparing your photo…", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("radio")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Start mirror", exact: true })).toBeEnabled();
   expect(await page.evaluate(() => window.__mirrorMedia.streams.length)).toBe(0);
 });
@@ -105,21 +104,21 @@ test("reference selection failure and an empty file picker preserve the image an
     goal: "A soft rose look.", currentStep: "Apply blush to your left cheek.", completedSummary: "Skin preparation complete.", complete: false,
   };
   await request.post(`${mockUrl}/__control`, { data: { answer: { transcript: "", reply: "Continue with the saved blush step.", action: "reply", guidanceContext: guidance } } });
-  const input = page.getByLabel("Reference makeup image", { exact: true });
+  const input = page.getByLabel(/^(Add|Change) photo$/);
   await input.setInputFiles(await imageFile(page, "retained-look.png", "#d184a5"));
-  await expect(page.getByText("Reference ready: retained-look.png", { exact: true })).toBeVisible();
-  await page.getByRole("radio", { name: "Guided makeup", exact: true }).check();
+  await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toBeVisible();
+  await page.getByRole("radio", { name: "Step-by-step guide", exact: true }).check();
   await page.getByRole("button", { name: "Start mirror", exact: true }).click();
   await expect(page.getByText(guidance.currentStep, { exact: true })).toBeVisible({ timeout: 25_000 });
-  const preview = page.getByRole("img", { name: "Reference makeup look", exact: true });
+  const preview = page.getByRole("img", { name: "Your look photo", exact: true });
   const originalPreview = await preview.getAttribute("src");
 
   await input.setInputFiles({ name: "corrupt.png", mimeType: "image/png", buffer: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0]) });
   await expect(page.getByRole("alert")).toContainText("This image could not be read.");
   await expect(preview).toHaveAttribute("src", originalPreview!);
   await expect(page.getByText(guidance.currentStep, { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Resume mirror", exact: true })).toBeVisible();
-  await expect.poll(async () => (await trackStates(page)).every((state) => state === "ended")).toBe(true);
+  await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
+  expect((await trackStates(page)).filter((state) => state === "live")).toHaveLength(2);
 
   const chooserPromise = page.waitForEvent("filechooser");
   await input.click();
@@ -128,10 +127,10 @@ test("reference selection failure and an empty file picker preserve the image an
   await chooser.setFiles([]);
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(preview).toHaveAttribute("src", originalPreview!);
-  await expect(page.getByText("Reference ready: retained-look.png", { exact: true })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Your look photo", exact: true })).toBeVisible();
   await expect(page.getByText(guidance.currentStep, { exact: true })).toBeVisible();
-  await expect(page.getByRole("radio", { name: "Guided makeup", exact: true })).toBeChecked();
-  await expect(page.getByRole("button", { name: "Resume mirror", exact: true })).toBeVisible();
+  await expect(page.getByRole("radio", { name: "Step-by-step guide", exact: true })).toBeChecked();
+  await expect(page.getByRole("button", { name: "Mute microphone", exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__mirrorMedia.speaking)).toBe(false);
 });
 
@@ -154,10 +153,10 @@ test("reference selection applies JPEG orientation and removes EXIF metadata", a
     0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 1, 0,
     0x12, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
   ]);
-  await page.getByLabel("Reference makeup image", { exact: true }).setInputFiles({
+  await page.getByLabel(/^(Add|Change) photo$/).setInputFiles({
     name: "oriented-look.jpg", mimeType: "image/jpeg", buffer: Buffer.concat([original.subarray(0, 2), exif, original.subarray(2)]),
   });
-  const preview = page.getByRole("img", { name: "Reference makeup look", exact: true });
+  const preview = page.getByRole("img", { name: "Your look photo", exact: true });
   await expect(preview).toBeVisible();
   const pixels = await preview.evaluate(async (element) => {
     const image = element as HTMLImageElement;

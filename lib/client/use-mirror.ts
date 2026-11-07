@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ApiError, GuidanceContext, HistoryTurn, MirrorMode, TurnEvent, TurnRequest } from "../contracts";
+import type { ApiError, GuidanceContext, HistoryTurn, MirrorMode, TurnEvent, TurnRequest, TurnResponse } from "../contracts";
 import { bytesToBase64, captureFrame, encodeWav, stopMedia } from "./media";
 import { createMirrorVad } from "./vad";
 import { CaptureSession } from "./session";
@@ -10,9 +10,27 @@ import { prepareReferenceImage, type PreparedReference } from "./reference-image
 import { Pcm16Decoder, PcmPlayer, preparePcmPlayback } from "./pcm-player";
 import { readTurnEvents, VoiceStreamTransportError } from "./turn-stream";
 import { MirrorCues } from "./cues";
+import { isSpeechRate } from "../contracts";
 
-export type MirrorPhase = "idle" | "starting" | "listening" | "hearing" | "thinking" | "speaking" | "paused" | "error";
+/** "stopped" means capture ended without the user choosing to end (page hidden, device lost, error). */
+export type MirrorPhase = "idle" | "starting" | "listening" | "hearing" | "thinking" | "speaking" | "stopped" | "error";
 export interface ConversationTurn extends HistoryTurn { id: number }
+export type InputMode = "voice" | "text";
+
+export interface MirrorOptions {
+  /** "text" never requests the microphone: questions are typed. */
+  inputMode?: InputMode;
+  /** When false, replies are shown but never synthesized or played. */
+  readAloud?: boolean;
+  /** Kokoro speaking speed, sent with each turn. */
+  speechRate?: number;
+}
+
+export const MODE_LABELS: Record<MirrorMode, string> = {
+  general: "Ask anything",
+  guided: "Step-by-step guide",
+  compare: "Quick check",
+};
 interface SpokenSegment { text: string; started: boolean; completed: boolean; samples: number; ended: boolean; decoder: Pcm16Decoder }
 interface StreamingReply { id: number; mode: MirrorMode; transcript: string; segments: Map<number, SpokenSegment>; done: boolean; complete: boolean }
 
@@ -24,7 +42,9 @@ function releaseReferencePreview(reference: PreparedReference | null) {
   if (reference?.previewUrl.startsWith("blob:")) URL.revokeObjectURL(reference.previewUrl);
 }
 
-export function useMirror() {
+export function useMirror(options: MirrorOptions = {}) {
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<CaptureSession | null>(null);
   const sessionIdRef = useRef(0);
@@ -38,6 +58,9 @@ export function useMirror() {
   const activeRef = useRef(false);
   const mountedRef = useRef(true);
   const phaseRef = useRef<MirrorPhase>("idle");
+  const mutedRef = useRef(false);
+  /** Input and playback choices are fixed when a session starts. */
+  const sessionOptionsRef = useRef({ typed: false, readAloud: true });
   const modeRef = useRef<MirrorMode>("general");
   const referenceRef = useRef<PreparedReference | null>(null);
   const referenceVersionRef = useRef(0);
@@ -54,6 +77,7 @@ export function useMirror() {
   const [notice, setNotice] = useState("");
   const [audioError, setAudioError] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+  const [muted, updateMuted] = useState(false);
   const [mode, updateMode] = useState<MirrorMode>("general");
   const [reference, updateReference] = useState<PreparedReference | null>(null);
   const [referenceLoading, updateReferenceLoading] = useState(false);
@@ -103,6 +127,22 @@ export function useMirror() {
     speechTimerRef.current = null;
   }
 
+  /** Mute keeps the camera running but sends silence to the voice detector, so nothing is heard or sent. */
+  function applyMute() {
+    sessionRef.current?.stream?.getAudioTracks().forEach((track) => { track.enabled = !mutedRef.current; });
+  }
+
+  function setMuted(next: boolean, announce = true) {
+    mutedRef.current = next;
+    if (mountedRef.current) updateMuted(next);
+    applyMute();
+    if (next) {
+      clearSpeechTimer();
+      if (phaseRef.current === "hearing") transition("listening");
+    }
+    if (announce) setNotice(next ? "Microphone muted. Mirror can't hear you." : "Microphone on. Mirror is listening.");
+  }
+
   function saveSpokenHistory(reply: StreamingReply) {
     const spoken = [...reply.segments.values()].filter((segment) => segment.started).map((segment) => segment.text).join(" ");
     if (!reply.transcript && !spoken) return;
@@ -139,9 +179,10 @@ export function useMirror() {
     if (mountedRef.current) setCameraReady(false);
   }
 
-  function pause(message = "Mirror paused. Camera and microphone are off. Use Resume mirror to continue.") {
+  /** Releases the camera and microphone for reasons outside the user's control. Start mirror reconnects. */
+  function stopCapture(message: string) {
     releaseResources();
-    transition("paused");
+    transition("stopped");
     setNotice(message);
   }
 
@@ -157,28 +198,33 @@ export function useMirror() {
     changeVisibleMode("general");
     saveGuidanceContext(undefined);
     pendingOpeningRef.current = false;
+    mutedRef.current = false;
+    if (mountedRef.current) updateMuted(false);
     transition("idle");
     setAudioError(false);
     setNotice("Session ended. Camera and microphone are off.");
   }
 
+  /** Sends an opening for the current mode when the mirror is running; otherwise Start will. */
+  function openCurrentMode() {
+    pendingOpeningRef.current = true;
+    if (activeRef.current) {
+      transition("listening");
+      void submitTurn(undefined, true);
+    }
+  }
+
   function prepareReferenceSelection() {
-    // Run before opening the native picker, which may hide the page on mobile.
+    // Invalidate any decode in progress. Capture keeps running; if the picker hides the page, the visibility handler stops it.
     referenceVersionRef.current++;
     setReferenceLoading(false);
     setReferenceError("");
-    if (activeRef.current || phaseRef.current === "starting") {
-      pause("Mirror paused while you choose a reference photo. Use Resume mirror when you're ready.");
-    }
   }
 
   async function selectReference(file: File | undefined) {
     const selectionVersion = ++referenceVersionRef.current;
     setReferenceError("");
     if (!file) { setReferenceLoading(false); return; }
-    if (activeRef.current || phaseRef.current === "starting") {
-      pause("Mirror paused while your reference photo is prepared. Use Resume mirror when you're ready.");
-    }
     setReferenceLoading(true);
     try {
       const prepared = await prepareReferenceImage(file);
@@ -186,14 +232,19 @@ export function useMirror() {
         releaseReferencePreview(prepared);
         return;
       }
-      // Capture never restarts as a side effect of selecting or replacing a photo.
-      if (activeRef.current || phaseRef.current === "starting") pause();
       const previousReference = referenceRef.current;
       referenceRef.current = prepared;
       updateReference(prepared);
       clearReferenceConversations();
-      if (modeRef.current !== "general") pendingOpeningRef.current = true;
       releaseReferencePreview(previousReference);
+      setNotice(modeRef.current === "general"
+        ? `Photo added. Choose ${MODE_LABELS.guided} or ${MODE_LABELS.compare} to use it.`
+        : "Photo changed. Starting again with the new photo.");
+      // Answers about the old photo are rejected by submitTurn's reference check.
+      if (modeRef.current !== "general") {
+        cancelReply();
+        openCurrentMode();
+      }
     } catch (error) {
       if (mountedRef.current && selectionVersion === referenceVersionRef.current) {
         setReferenceError(error instanceof Error ? error.message : "This photo could not be prepared. Please choose another image.");
@@ -208,34 +259,32 @@ export function useMirror() {
     setReferenceLoading(false);
     setReferenceError("");
     const previousMode = modeRef.current;
-    if (activeRef.current || phaseRef.current === "starting" || previousMode !== "general") {
-      pause("Reference photo removed. Use Resume mirror to continue in General mode.");
-    }
+    if (previousMode !== "general") cancelReply();
     releaseReferencePreview(referenceRef.current);
     referenceRef.current = null;
     updateReference(null);
     clearReferenceConversations();
     changeVisibleMode("general");
-    if (previousMode !== "general") pendingOpeningRef.current = true;
+    if (previousMode !== "general") {
+      setNotice(`Photo removed. Mode: ${MODE_LABELS.general}.`);
+      if (activeRef.current) transition("listening");
+      else pendingOpeningRef.current = true;
+    } else setNotice("Photo removed.");
   }
 
   function setMode(nextMode: MirrorMode) {
     if (nextMode === modeRef.current || referenceLoadingRef.current) return;
     if (nextMode !== "general" && !referenceRef.current) {
-      setReferenceError("Add a reference photo before choosing this mode.");
+      setReferenceError("Add a photo of the look before choosing this mode.");
       return;
     }
-    // A choice made before starting does not create a paused capture session.
-    if (phaseRef.current === "idle") {
-      const label = nextMode === "general" ? "General conversation" : nextMode === "guided" ? "Guided makeup" : "Compare with reference";
-      setNotice(`${label} selected. Start your mirror when ready.`);
-    } else {
-      // Invalidate the old mode before allowing any new audio or camera capture.
-      pause("Mode changed. Camera and microphone are off. Use Resume mirror when you're ready.");
-    }
+    // Discard anything in flight for the old mode, then switch without turning the camera off.
+    cancelReply();
+    clearSpeechTimer();
     changeVisibleMode(nextMode);
-    pendingOpeningRef.current = true;
     setReferenceError("");
+    setNotice(`Mode: ${MODE_LABELS[nextMode]}.`);
+    openCurrentMode();
   }
 
   function stopTalking() {
@@ -245,20 +294,28 @@ export function useMirror() {
 
   function failAudio(message: string) {
     releaseResources();
-    transition("paused");
+    transition("stopped");
     setAudioError(true);
-    setNotice(`${message} Mirror is paused. Use Resume mirror and ask your question again.`);
+    setNotice(`${message} Mirror stopped. Select Reconnect audio and ask your question again.`);
   }
 
-  async function submitTurn(audio?: Float32Array, opening = false) {
+  /** A spoken "pause" mutes the microphone; there is no paused state the user has to resume from. */
+  function muteFromSpeech() {
+    if (!sessionOptionsRef.current.typed) setMuted(true);
+    if (activeRef.current) transition("listening");
+  }
+
+  async function submitTurn(audio?: Float32Array, opening = false, text?: string) {
     if (!activeRef.current) return;
     const sessionId = sessionIdRef.current;
     const requestMode = modeRef.current;
     const requestReference = requestMode === "general" ? null : referenceRef.current;
     if (requestMode !== "general" && !requestReference) {
-      pause("Add a reference photo before resuming this mode.");
+      setReferenceError("Add a photo of the look before using this mode.");
       return;
     }
+    const spoken = sessionOptionsRef.current.readAloud;
+    const speechRate = optionsRef.current.speechRate ?? 1;
     cancelReply();
     const generation = generationRef.current;
     const playback = ++playbackRef.current;
@@ -273,7 +330,7 @@ export function useMirror() {
     let frame;
     try { frame = video ? captureFrame(video, lastFrameRef.current) : undefined; } catch { frame = undefined; }
     setCameraReady(Boolean(frame));
-    setNotice(frame ? "" : "The current camera view is unavailable. Mirror can hear you, but cannot assess your appearance right now.");
+    setNotice(frame ? "" : "The current camera view is unavailable. Mirror can answer, but cannot check your appearance right now.");
     const body: TurnRequest = {
       turnId,
       mode: requestMode,
@@ -283,6 +340,8 @@ export function useMirror() {
       ...(frame ? { frame } : {}),
       ...(opening ? { opening: true } : {}),
       ...(audio ? { audio: bytesToBase64(encodeWav(audio)) } : {}),
+      ...(text && !opening ? { text } : {}),
+      ...(spoken && isSpeechRate(speechRate) && speechRate !== 1 ? { speechRate } : {}),
     };
     transition("thinking");
     cuesRef.current?.processing();
@@ -298,7 +357,9 @@ export function useMirror() {
     };
     try {
       const response = await fetch(appPath("/api/turn"), {
-        method: "POST", headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+        method: "POST",
+        // Without the stream header the server answers in JSON and never synthesizes speech.
+        headers: { "Content-Type": "application/json", ...(spoken ? { Accept: "application/x-ndjson" } : {}) },
         body: JSON.stringify(body), signal: controller.signal,
       });
       responseReceived = true;
@@ -307,6 +368,26 @@ export function useMirror() {
         requestFailure = true;
         const error = await response.json().catch(() => null) as ApiError | null;
         throw new Error(error?.error?.message ?? "Mirror could not answer just now. Please try asking again.");
+      }
+      if (!spoken) {
+        const result = await response.json() as TurnResponse;
+        if (!current() || result.turnId !== turnId) return;
+        clearTimeout(timeout);
+        cuesRef.current?.stop();
+        replyRef.current = null;
+        requestRef.current = null;
+        if (result.transcript || result.reply) {
+          saveHistory([...historiesRef.current[requestMode], { id: turnId, user: result.transcript, assistant: result.reply }], requestMode);
+        }
+        if (result.action === "end") { end(); return; }
+        if (result.action === "stop") { stopTalking(); return; }
+        if (result.action === "pause") { muteFromSpeech(); return; }
+        if (result.reply.trim() && (opening || result.transcript.trim())) {
+          pendingOpeningRef.current = false;
+          if (requestMode === "guided" && result.guidanceContext) saveGuidanceContext({ ...result.guidanceContext });
+        }
+        transition("listening");
+        return;
       }
       if (!response.body || !response.headers.get("content-type")?.includes("application/x-ndjson")) throw new Error("The assistant did not provide a voice stream.");
       let meta: Extract<TurnEvent, { type: "meta" }> | undefined;
@@ -327,7 +408,14 @@ export function useMirror() {
           reply.transcript = event.transcript;
           saveSpokenHistory(reply);
           totalDeadline = setTimeout(() => { timedOut = true; controller.abort(); }, 120_000);
-          if (event.action === "pause") { pause(); return; }
+          if (event.action === "pause") {
+            // No speech is synthesized for a pause; the status region announces the mute instead.
+            reply.complete = true;
+            saveSpokenHistory(reply);
+            cancelReply(false);
+            muteFromSpeech();
+            return;
+          }
           if (event.action === "end") { end(); return; }
           if (event.action === "stop") { stopTalking(); return; }
           continue;
@@ -426,57 +514,74 @@ export function useMirror() {
     }
   }
 
+  /** Sends a typed question or a tapped conversation starter. Returns false if it could not be sent. */
+  function sendText(value: string): boolean {
+    const text = value.trim().slice(0, 1_000);
+    if (!activeRef.current) return false;
+    if (!text) { setNotice("Type a question first, then select Send."); return false; }
+    void submitTurn(undefined, false, text);
+    return true;
+  }
+
   async function start() {
     if (activeRef.current || phaseRef.current === "starting") return;
     if (referenceLoadingRef.current) {
-      setNotice("Your reference photo is still being prepared. Start your mirror when it is ready.");
+      setNotice("Your photo is still being prepared. Start your mirror when it is ready.");
       return;
     }
     if (modeRef.current !== "general" && !referenceRef.current) {
-      setReferenceError("Add a reference photo before starting this mode.");
+      setReferenceError("Add a photo of the look before starting this mode.");
       return;
     }
     releaseResources();
     const sessionId = sessionIdRef.current;
-    const sessionMode = modeRef.current;
-    const current = () => mountedRef.current && sessionId === sessionIdRef.current && sessionMode === modeRef.current;
-    const listening = () => current() && activeRef.current;
+    const typed = optionsRef.current.inputMode === "text";
+    const spoken = optionsRef.current.readAloud !== false;
+    sessionOptionsRef.current = { typed, readAloud: spoken };
+    const devices = typed ? "camera" : "camera and microphone";
+    const current = () => mountedRef.current && sessionId === sessionIdRef.current;
+    const listening = () => current() && activeRef.current && !mutedRef.current;
     transition("starting");
     setNotice("");
     setAudioError(false);
     let stage: "audio" | "permission" | "vad" = "audio";
     try {
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Camera and microphone access need a secure connection. Open Mirror on HTTPS, or localhost on this computer.");
+        throw new Error(`The ${devices} need a secure connection. Open Mirror on HTTPS, or localhost on this computer.`);
       }
       // Unlock audio synchronously in the button gesture, before awaiting permissions.
-      const context = new AudioContext();
+      // A typed session with replies on screen only never needs audio at all.
+      const context = typed && !spoken ? null : new AudioContext();
       const session = new CaptureSession(sessionId, context);
       sessionRef.current = session;
-      cuesRef.current = new MirrorCues(context);
-      void context.resume().catch(() => { /* A user gesture will be required on retry. */ });
+      if (context) {
+        cuesRef.current = new MirrorCues(context);
+        void context.resume().catch(() => { /* A user gesture will be required on retry. */ });
+      }
       stage = "permission";
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const video = { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } };
+      const stream = await navigator.mediaDevices.getUserMedia(typed ? { video } : {
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video,
       });
       if (!current()) { stopMedia(stream); return; }
       if (!session.attachStream(stream)) return;
+      applyMute();
       for (const track of stream.getTracks()) {
         track.addEventListener("ended", () => {
-          if (current()) pause("Camera or microphone access ended. Use Resume mirror to reconnect.");
+          if (current()) stopCapture(`${typed ? "Camera" : "Camera or microphone"} access ended. Select Start mirror to reconnect.`);
         });
       }
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        await video.play();
+      const videoElement = videoRef.current;
+      if (videoElement) {
+        videoElement.srcObject = stream;
+        await videoElement.play();
         if (!current()) return;
         let previousTime = -1;
         const updateFrame = () => {
           if (!current()) return;
-          if (video.readyState >= 2 && !video.paused && video.currentTime !== previousTime) {
-            previousTime = video.currentTime;
+          if (videoElement.readyState >= 2 && !videoElement.paused && videoElement.currentTime !== previousTime) {
+            previousTime = videoElement.currentTime;
             lastFrameRef.current = Date.now();
             if (mountedRef.current) setCameraReady(true);
           } else if (Date.now() - lastFrameRef.current > 2000 && mountedRef.current) setCameraReady(false);
@@ -484,55 +589,59 @@ export function useMirror() {
         updateFrame();
         frameTimerRef.current = setInterval(updateFrame, 250);
       }
-      stage = "audio";
-      await preparePcmPlayback(context);
-      if (!current()) return;
-      stage = "vad";
-      await session.initialize(() => createMirrorVad(stream, context, {
-        onSpeechStart: () => {
-          if (!listening()) return;
-          clearSpeechTimer();
-          // Flush at 29 seconds so the pre-roll remains below the 30-second cap.
-          speechTimerRef.current = setTimeout(() => {
-            const currentVad = session.vad;
-            if (!listening() || !currentVad) return;
-            void currentVad.pause().then(() => {
-              if (listening() && session.vad === currentVad) return currentVad.start();
-            }).catch(() => {
-              if (current()) pause("The voice listener was interrupted. Use Resume mirror to continue.");
-            });
-          }, 29_000);
-        },
-        onSpeechRealStart: () => {
-          if (!listening()) return;
-          cancelReply();
-          transition("hearing");
-          setNotice("");
-        },
-        onSpeechEnd: (samples) => {
-          if (!listening()) return;
-          clearSpeechTimer();
-          void submitTurn(samples);
-          if (listening()) cuesRef.current?.captured();
-        },
-        onVADMisfire: () => { if (listening()) clearSpeechTimer(); },
-      }));
-      if (!current()) return;
+      if (context && spoken) {
+        stage = "audio";
+        await preparePcmPlayback(context);
+        if (!current()) return;
+      }
+      if (context && !typed) {
+        stage = "vad";
+        await session.initialize(() => createMirrorVad(stream, context, {
+          onSpeechStart: () => {
+            if (!listening()) return;
+            clearSpeechTimer();
+            // Flush at 29 seconds so the pre-roll remains below the 30-second cap.
+            speechTimerRef.current = setTimeout(() => {
+              const currentVad = session.vad;
+              if (!listening() || !currentVad) return;
+              void currentVad.pause().then(() => {
+                if (listening() && session.vad === currentVad) return currentVad.start();
+              }).catch(() => {
+                if (current()) stopCapture("The voice listener was interrupted. Select Start mirror to continue.");
+              });
+            }, 29_000);
+          },
+          onSpeechRealStart: () => {
+            if (!listening()) return;
+            cancelReply();
+            transition("hearing");
+            setNotice("");
+          },
+          onSpeechEnd: (samples) => {
+            if (!listening()) return;
+            clearSpeechTimer();
+            void submitTurn(samples);
+            if (listening()) cuesRef.current?.captured();
+          },
+          onVADMisfire: () => { if (listening()) clearSpeechTimer(); },
+        }));
+        if (!current()) return;
+      }
       activeRef.current = true;
       transition("listening");
       if (pendingOpeningRef.current || historyRef.current.length === 0) void submitTurn(undefined, true);
-      else setNotice("Mirror reconnected. Ask your question again when you're ready.");
+      else setNotice(typed ? "Mirror reconnected. Type your question when you're ready." : "Mirror reconnected. Ask your question again when you're ready.");
     } catch (error) {
       if (!current()) return;
       releaseResources();
       transition("error");
-      setAudioError(stage === "audio");
+      setAudioError(stage === "audio" && spoken);
       if (error instanceof DOMException && error.name === "NotAllowedError") {
-        setNotice("Camera or microphone permission was denied. Allow both in your browser's site permissions, then start again.");
+        setNotice(`${typed ? "Camera" : "Camera or microphone"} permission was denied. Allow it in your browser's site settings, then start again.`);
       } else if (error instanceof DOMException && error.name === "NotFoundError") {
-        setNotice("No camera or microphone was found. Connect both devices, then start again.");
+        setNotice(`No ${devices} was found. Connect ${typed ? "a camera" : "both devices"}, then start again.`);
       } else if (error instanceof DOMException && error.name === "NotReadableError") {
-        setNotice("Your camera or microphone is busy. Close other apps using it, then start again.");
+        setNotice(`Your ${devices} ${typed ? "is" : "are"} busy. Close other apps using ${typed ? "it" : "them"}, then start again.`);
       } else if (stage === "vad") {
         setNotice("The voice listener could not start. Check your connection, reload this page, and try again.");
       } else {
@@ -543,14 +652,15 @@ export function useMirror() {
 
   useEffect(() => {
     mountedRef.current = true;
+    // Capture never continues out of sight. Start mirror reconnects when the person returns.
     const visibility = () => {
       if (document.hidden && (activeRef.current || phaseRef.current === "starting")) {
-        pause("Mirror paused while the page was away. Camera and microphone are off. Use Resume mirror to continue.");
+        stopCapture("Mirror stopped while the page was in the background. Camera and microphone are off. Select Start mirror to continue.");
       }
     };
     const pagehide = () => {
       if (activeRef.current || phaseRef.current === "starting") {
-        pause("Mirror paused while you were away. Camera and microphone are off. Use Resume mirror to continue.");
+        stopCapture("Mirror stopped while you were away. Camera and microphone are off. Select Start mirror to continue.");
       }
     };
     document.addEventListener("visibilitychange", visibility);
@@ -568,7 +678,8 @@ export function useMirror() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { videoRef, phase, history, notice, audioError, cameraReady, start, pause: () => pause(), end, stopTalking,
+  return { videoRef, phase, history, notice, audioError, cameraReady, start, end, stopTalking,
+    muted, toggleMute: () => setMuted(!mutedRef.current), sendText,
     reference, referenceLoading, referenceError, mode, guidanceContext,
     prepareReferenceSelection, selectReference, removeReference, setMode,
     active: ["listening", "hearing", "thinking", "speaking"].includes(phase) };

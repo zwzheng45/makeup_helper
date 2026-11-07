@@ -1,4 +1,4 @@
-import type { ApiError, TurnEvent, TurnResponse } from "../contracts";
+import type { ApiError, SpeechRate, TurnEvent, TurnResponse } from "../contracts";
 
 const PCM_BYTES_PER_SECOND = 24_000 * 2;
 const MAX_SEGMENT_AUDIO_BYTES = 30 * PCM_BYTES_PER_SECOND;
@@ -30,7 +30,7 @@ function failure(error: unknown, signal: AbortSignal): ApiError["error"] {
   return { code: safe.code, message: safe.message, retryable: safe.retryable };
 }
 
-/** The sidecar receives text only, on the explicitly supported local network. */
+/** The sidecar receives text (and a speed, when not normal) only, on the explicitly supported local network. */
 export function localTtsEndpoint(baseUrl = "http://tts:8000"): URL {
   const invalid = () => new SpeechFailure("TTS_NOT_CONFIGURED", "The local voice service configuration needs attention.", false);
   let url: URL;
@@ -119,6 +119,7 @@ async function* synthesize(
   fetcher: typeof fetch,
   controller: AbortController,
   firstAudioTimeoutMs: number,
+  speed: number,
 ): AsyncGenerator<Uint8Array> {
   const { signal } = controller;
   if (signal.aborted) throw signal.reason ?? cancelled();
@@ -134,7 +135,8 @@ async function* synthesize(
     const fetching = fetcher(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "audio/pcm" },
-      body: JSON.stringify({ text }),
+      // Normal speed sends text alone, so the default sidecar contract is unchanged.
+      body: JSON.stringify(speed === 1 ? { text } : { text, speed }),
       signal,
       redirect: "error",
       cache: "no-store",
@@ -182,7 +184,7 @@ async function* synthesize(
   }
 }
 
-export function createSpeechResponse(result: TurnResponse, requestSignal: AbortSignal, dependencies: SpeechDependencies = {}): Response {
+export function createSpeechResponse(result: TurnResponse, requestSignal: AbortSignal, dependencies: SpeechDependencies = {}, speed: SpeechRate = 1): Response {
   const fetcher = dependencies.fetch ?? fetch;
   const controller = new AbortController();
   const abort = () => controller.abort(cancelled());
@@ -205,7 +207,7 @@ export function createSpeechResponse(result: TurnResponse, requestSignal: AbortS
         for (const text of speechSegments(result.reply)) {
           if (controller.signal.aborted) throw controller.signal.reason;
           yield { type: "text", segmentId, text };
-          for await (const chunk of synthesize(text, endpoint, fetcher, controller, dependencies.firstAudioTimeoutMs ?? DEFAULT_FIRST_AUDIO_TIMEOUT_MS)) {
+          for await (const chunk of synthesize(text, endpoint, fetcher, controller, dependencies.firstAudioTimeoutMs ?? DEFAULT_FIRST_AUDIO_TIMEOUT_MS, speed)) {
             totalBytes += chunk.byteLength;
             if (totalBytes > MAX_TURN_AUDIO_BYTES) throw new SpeechFailure("TTS_AUDIO_TOO_LARGE", "The voice service returned too much audio. Please try again.");
             yield { type: "audio", segmentId, data: Buffer.from(chunk).toString("base64"), sampleRate: 24_000 };

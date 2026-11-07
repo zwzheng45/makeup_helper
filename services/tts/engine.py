@@ -9,6 +9,8 @@ SAMPLE_RATE = 24_000
 CHUNK_SAMPLES = 2_400
 MAX_TEXT = 1_000
 MAX_PHRASE = 240
+# Talking speeds the app offers: slow, normal and fast.
+SPEEDS = (0.8, 1.0, 1.25)
 
 
 def phrases(text: str):
@@ -76,10 +78,10 @@ class KokoroEngine:
         self.voice = manifest["voice"]
         self.model.get_voice_style(self.voice)
 
-    def chunks(self, text: str):
+    def chunks(self, text: str, speed: float = 1.0):
         total_samples = 0
         for phrase in phrases(text):
-            audio, rate = self.model.create(phrase, voice=self.voice, speed=1.0, lang="en-us")
+            audio, rate = self.model.create(phrase, voice=self.voice, speed=speed, lang="en-us")
             samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
             total_samples += len(samples)
             if rate != SAMPLE_RATE or not len(samples) or not self.np.isfinite(samples).all() or total_samples > SAMPLE_RATE * 90:

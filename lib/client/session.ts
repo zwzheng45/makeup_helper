@@ -14,7 +14,8 @@ export class CaptureSession {
   private initialization: Promise<SessionVad> | null = null;
   private disposal: Promise<void> | null = null;
 
-  constructor(readonly id: number, readonly context: AudioContext) {}
+  /** `context` is null for camera-only (typed) sessions, which never open the microphone. */
+  constructor(readonly id: number, readonly context: AudioContext | null) {}
 
   attachStream(stream: MediaStream): boolean {
     if (this.closed) { stopMedia(stream); return false; }
@@ -41,7 +42,7 @@ export class CaptureSession {
       try { await this.initialization; } catch { /* The factory cleans up failed initialization. */ }
       try { await this.vad?.destroy(); } catch { /* Browser resources can already be gone. */ }
       this.vad = null;
-      try { if (this.context.state !== "closed") await this.context.close(); } catch { /* Already closed. */ }
+      try { if (this.context && this.context.state !== "closed") await this.context.close(); } catch { /* Already closed. */ }
     })();
     return this.disposal;
   }

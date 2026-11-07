@@ -7,7 +7,7 @@ import select
 import socket
 import time
 
-from engine import KokoroEngine, MAX_TEXT, SAMPLE_RATE
+from engine import KokoroEngine, MAX_TEXT, SAMPLE_RATE, SPEEDS
 from scheduler import BusyError, Scheduler
 
 
@@ -79,7 +79,11 @@ class SpeechHandler(BaseHTTPRequestHandler):
             if len(raw) != length:
                 return
             body = json.loads(raw)
-            if not isinstance(body, dict) or set(body) != {"text"} or not isinstance(body["text"], str):
+            if not isinstance(body, dict) or "text" not in body or not set(body) <= {"text", "speed"} or not isinstance(body["text"], str):
+                raise ValueError()
+            # Only the offered speeds are accepted; bool is an int subclass and NaN never matches.
+            speed = body.get("speed", 1.0)
+            if isinstance(speed, bool) or not isinstance(speed, (int, float)) or float(speed) not in SPEEDS:
                 raise ValueError()
             text = body["text"].strip()
             if not text or len(text) > MAX_TEXT or any(ord(char) < 32 and char not in "\t\n\r" for char in text):
@@ -88,7 +92,7 @@ class SpeechHandler(BaseHTTPRequestHandler):
             self.json_response(400, {"error": "INVALID_TEXT"})
             return
         try:
-            job = self.server.scheduler.submit(text)
+            job = self.server.scheduler.submit(text, float(speed))
         except BusyError:
             self.json_response(503, {"error": "TTS_BUSY"})
             return

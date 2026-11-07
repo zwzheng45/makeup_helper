@@ -97,6 +97,14 @@ describe("capture startup cancellation", () => {
     await newSession.dispose();
   });
 
+  it("supports a camera-only session without an audio context", async () => {
+    const session = new CaptureSession(1, null);
+    const track = { stop: vi.fn() };
+    expect(session.attachStream({ getTracks: () => [track] } as unknown as MediaStream)).toBe(true);
+    await expect(session.dispose()).resolves.toBeUndefined();
+    expect(track.stop).toHaveBeenCalledOnce();
+  });
+
   it("closes its context when initialization fails", async () => {
     const close = vi.fn(async () => {});
     const session = new CaptureSession(1, { state: "running", close } as unknown as AudioContext);
